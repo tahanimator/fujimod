@@ -108,6 +108,7 @@ members = [
   "crates/usb-app80",
   "crates/usb-app80-types",
   "crates/workflows",
+  "crates/xe2-capture",
   "bindings/python/app80",
   "bindings/python/app80-values",
   "bindings/python/base",

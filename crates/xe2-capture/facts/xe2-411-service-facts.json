@@ -1,0 +1,54 @@
+{
+  "format": 1,
+  "about": "Hand-authored X-E2 4.11 service-capture facts for fujimod-xe2-capture. Not generated. A fact is used only when its value is present and its confidence is high; any other fact makes the tool refuse the steps that need it and name the fact.",
+  "firmware_id": "xe2-411",
+  "firmware_sha256": "d324e1475dd99d5ebace3bf689262df671829adb32262ba13cd9b0743ca99bb7",
+  "service_usb": {
+    "value": { "vendor_id": 1227, "product_id": 65408 },
+    "confidence": "high",
+    "evidence": "Firmware: two USB device descriptors (bLength 0x12, bcdUSB 0x0200, bMaxPacketSize0 0x40, idVendor 0x04cb, idProduct 0xff80, bcdDevice 0x0100) in decoded stream-0032025c at 0x0146bfc0 and 0x0146bfd4. Hardware: owner's X-E2 enumerated on Windows as USB\\VID_04CB&PID_FF80 after selector UP + full shutter at power-on with USB connected (BOARD.md, Owner camera test, 2026-11-18)."
+  },
+  "product": {
+    "value": "X-E2",
+    "confidence": "high",
+    "evidence": "catalog/firmware/xe2/4.11/bulk.generated.json and execution.generated.json `product`, written by the upstream locator (generation.generated.json: xe2-411 bulk available)."
+  },
+  "internal_version": {
+    "value": "3.05",
+    "confidence": "high",
+    "evidence": "catalog/firmware/xe2/4.11/bulk.generated.json and execution.generated.json `internal_version` (upstream locator)."
+  },
+  "entry": {
+    "value": {
+      "physical_keys": ["selector UP", "shutter fully pressed"],
+      "usb_condition": "USB cable connected to the PC before switching ON; rear LED solid green"
+    },
+    "confidence": "high",
+    "evidence": "Owner hardware test, not firmware analysis (BOARD.md, Owner camera test). U9 found no main-firmware code that samples these keys at power-on, so the check is presumably in the boot ROM or loader."
+  },
+  "code_checks": {
+    "value": "catalog:bulk.code_checks",
+    "confidence": "high",
+    "evidence": "All 15 bulk.generated.json code_checks, the 8 upload code_checks and the 4096-byte mapped_probe were re-hashed by U10 against the streams decoded from FWUP0004.DAT (sha256 d324e147...ca99bb7) with fujimod.firmware.scan/decode: 24/24 sha256 match. The tool checks the 15 bulk code_checks on the camera before any write."
+  },
+  "read_gate": {
+    "value": null,
+    "confidence": "unlocated",
+    "evidence": "Not located for xe2-411. This is the configuration-RAM byte that enables the FF80 debug memory reads (`debug_offset` in the service-workflow model). The repo's EXR II flash reader hard-codes 0xf7 for the X70 family (crates/workflows/src/flash/exr2.rs). That value is not confirmed on this firmware and is not taken from another body."
+  },
+  "reset_guard": {
+    "value": null,
+    "confidence": "unlocated",
+    "evidence": "Not located for xe2-411. This is the configuration-RAM byte that stops the stock teardown from restoring defaults (`guard.offset`). The X70 family value 0xa3 (crates/workflows/src/flash/build.rs) is not confirmed on this firmware, and the guard's state words, callback table, aliases and output-state checks (service-workflow `guard`) are also not located."
+  },
+  "slow_read_bytes": {
+    "value": null,
+    "confidence": "unlocated",
+    "evidence": "Not located for xe2-411: the largest FF80 0x200001 read the firmware accepts per command (`configuration.memory_read_bytes`). It needs the same FF80 handler analysis as read_gate."
+  },
+  "flash_reader": {
+    "value": null,
+    "confidence": "unlocated",
+    "evidence": "No read-only flash path exists. flash.generated.json says the internal flash is 128 MiB raw NAND (no memory-mapped window), and its only located reader is transport `exr2-query-heap`. That reader allocates camera heap, uploads and executes a reader image, and swaps the stock diagnostic callback (crates/workflows/src/flash/exr2.rs). Those are RAM writes and code execution beyond the two RAM gates this tool allows, so the whole-flash backup is refused by policy."
+  }
+}

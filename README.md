@@ -94,6 +94,23 @@ value wrappers, command/action factories, structured replies and language export
 from Rust declarations. Routine service features need only Rust code; shared
 adapters handle execution and language boundaries.
 
+## X-E2 4.11 local service-mode capture (Windows)
+
+[`crates/xe2-capture`](crates/xe2-capture/README.md) is a read-only command-line
+tool. It identifies an X-E2 4.11 in service mode and dumps its camera state to
+a local folder. Windows steps:
+
+1. Build it with `cargo build --release -p fujimod-xe2-capture`.
+2. Enter service mode with USB connected: hold selector UP and the full
+   shutter while switching ON. The LED turns solid green.
+3. Bind WinUSB to `04CB FF80` with Zadig.
+4. Always run `fujimod-xe2-capture dry-run` first.
+5. Then run `fujimod-xe2-capture capture NEW_FOLDER`.
+6. Leave service mode by pulling the battery, never with the OFF switch.
+
+The whole-flash backup is refused, and the capture stays refused until its
+missing facts are located; the crate README explains why.
+
 ## Continuous integration
 
 See [CI.md](CI.md) for the required checks, local commands, coverage reports and

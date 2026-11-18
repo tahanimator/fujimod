@@ -142,7 +142,8 @@
       "fujimod-recovery",
       "fujimod-runtime-install",
       "fujimod-catalog-memory-reservations",
-      "fujimod-sync-protocol"
+      "fujimod-sync-protocol",
+      "fujimod-xe2-capture"
     ]
   },
   "remaining": {

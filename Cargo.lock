@@ -3386,6 +3386,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fujimod-xe2-capture"
+version = "0.1.0"
+dependencies = [
+ "fujimod-catalog",
+ "fujimod-catalog-bulk",
+ "fujimod-usb",
+ "fujimod-workflows",
+ "fujimod-workspace-hack",
+ "futures-lite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
