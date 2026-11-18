@@ -23,6 +23,7 @@ touches a physical camera.
 | U5 | EXR II NAND bootloader facts located; Boot-patch triggers, clears and free spaces located | todo | | | |
 | U6 | Emulator: SD boot v2 autostart starts; patch triggers fire; FujiMod boots from SD (needs U5) | todo | | | |
 | U7 | Language font bank located and kept out of mod memory | todo | | | |
+| U8 | X-E2 4.11 `service` and `first-start` fact tables (missing in catalog/generation.generated.json) | claimed | U8-worker | Sonnet 5.5 | Investigating how other bodies derive these tables. |
 
 ## Worker notes
 
