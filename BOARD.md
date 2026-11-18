@@ -29,8 +29,78 @@ touches a physical camera.
 | U11 | Locate xe2-411 service facts read_gate, reset_guard, slow_read_bytes | blocked | U11-worker | Opus | All three remain UNLOCATED: no X-E2 4.11 code directly shows the values and X70's 0xf7/0xa3 were not borrowed (guessing). Located the FF80 command infrastructure (dispatch table 0x146c024, descriptors 04cb:ff80, session struct 0x15434f0, parser 0x10c89c0) but did not isolate the 200001 read-handler gate/size or the teardown guard-byte to a high bar. Tool unchanged; gates intact; capture still correctly refused; tests 12/12 + workflows service_capture 11/11 pass. See "U11 findings". |
 | U13 | Flash backup via temporary RAM code in xe2-capture (owner-approved) | review | U13-worker | Opus | `fujimod-xe2-capture capture DIR --flash` (commit 95caadf) reuses `fujimod_workflows::flash::backup` (EXR II `exr2-query-heap`) unchanged: upload to a stock heap block in RAM, run, read NAND via the stock page reader, clean up; read twice, hashed, cleanup read back and reported. Still REFUSED before any USB command: read_gate/reset_guard/slow_read_bytes unlocated, AND no reviewed X-E2 reader image exists in the repo to pin (the reader source and staged flash-reader artifacts are external). Tests 20/20; workflows 87/87. See "U13 findings". |
 | U14 | Emulator trace of xe2-411 service facts (read_gate, reset_guard, slow_read_bytes) | blocked | U14-worker | Opus | Could NOT bring up X-E2 4.11 in the repo's emulator on this machine, so no FF80 handler behavior was observed; all three facts stay null/unlocated (not guessed, X70's 0xf7/0xa3 not borrowed). Blockers: (A) native boot refuses xe2-411 — run.json has null inputs/scene/execution ("configuration xe2-411 declares no startup inputs", reproduced) and open_exr2 requires the 16 KiB boot ROM sha256 4ecedfbf… which is absent everywhere; (B) web/wasm simulated camera needs a prebuilt USB wasm bundle + emulate.usb catalog facts + xe2 boot.service controls + wasm/nightly toolchain, all absent/unavailable; (C) no in-repo fixture runs the firmware answering FF80 (usb-app80 tests use a scripted transport, not an emulated board). Unicorn CPU + emulator crates build/run here — the blocker is firmware bring-up, not execution. Facts evidence updated with the emulator attempt; gates intact; capture still correctly refused. Tests 20/20, service_capture 11/11, plan refuses steps 2-6 naming the facts. See "U14 findings". |
+| U15 | Explicit unverified X70-assumed service-values override for xe2-capture | review | U15-worker | Opus | Added an opt-in override: flag `--assume-x70-values` + separate inputs file `facts/xe2-411-service-facts.x70-assumed.json` injects the X70 1.10 values (read_gate offset 0xf7=1, reset_guard 0xa3=1, slow_read_bytes 256) for the three unlocated facts ONLY, each marked "UNVERIFIED: borrowed from x70-110". Honest `xe2-411-service-facts.json` untouched (three facts stay null/unverified). Without the flag capture still refuses; with it the state dump runs after a loud multi-line WARNING. Identity (04cb:ff80 / X-E2 / 3.05), stock-code hash checks, the write allowlist, the reader hash pin, twice-read/verify and cleanup are all unchanged; the manifest records `assumed_x70_values` with provenance. `--flash` still blocked (no reviewed reader pinned). Dry-run cannot confirm the values — first real run is the test. Tests 27/27; workflows service_capture 11/11; clippy clean. See "U15 findings". |
 
 ## Worker notes
+
+### U15 findings — explicit unverified X70-assumed service-values override
+
+**Outcome: implemented and tested.** Tom can now run the X-E2 capture using the
+X70 1.10 values for the three unlocated service facts, behind an explicit flag,
+without those values being recorded as confirmed X-E2 facts and without any
+other safety gate being weakened.
+
+**The three borrowed values and where each came from (all X70 1.10):**
+- `read_gate` = configuration-RAM offset `0xf7` (247), enabled value `1`.
+  Source: the X70 ServiceSetup fixture `debug_offset: 247` in
+  `crates/workflows/src/service_mode/tests.rs` (identity.products=["X70"]);
+  consistent with `crates/workflows/src/flash/exr2.rs` `configuration_flags`
+  reading offset `0xf7` and `require_debug_access` requiring it `== 1`.
+- `reset_guard` = offset `0xa3` (163), value `1`. Source: the same X70 fixture
+  `guard {offset:163, value:1}`; consistent with `exr2.rs` reading offset
+  `0xa3`; `catalog-workflows` requires `guard.value == 1`.
+- `slow_read_bytes` = `256`. Source: the same X70 fixture
+  `configuration.memory_read_bytes: 256`; `crates/catalog-workflows/src/lib.rs`
+  caps `memory_read_bytes` at 256. (The X70 `service-workflow.generated.json`
+  is not checked in for any body — U8/U10/U11 — so this in-repo X70 fixture is
+  the authoritative in-repo trace of these values.)
+
+**How the override works.** A separate inputs file
+`facts/xe2-411-service-facts.x70-assumed.json` carries only those three values,
+each with provenance "UNVERIFIED: borrowed from x70-110" and an `x70_source`
+pointer. The flag `--assume-x70-values` loads it (`AssumedX70Values::apply_to`)
+and injects the three into a live `ServiceFacts` as high-confidence facts whose
+evidence begins with the assumed mark. The checked-in honest facts file is
+never read-modified-written; it still has all three `null` / `unlocated`.
+
+**What the flag does NOT bypass (reviewed in code and tests):**
+- `apply_to` touches only `read_gate`, `reset_guard`, `slow_read_bytes`. It does
+  not alter `service_usb`, `product`, `internal_version`, `code_checks` or
+  `flash_reader`. So identity (04cb:ff80 / X-E2 / 3.05) and the stock-code hash
+  checks run unchanged before any write.
+- The write allowlist is still `Policy{read_gate, reset_guard}`: single-byte,
+  page-0 RAM writes at exactly those two offsets, enabled-or-restore for the
+  gate and enabled-only for the guard. Every other write (other RAM bytes,
+  stored config, memory writes, firmware/restart/console/event) is blocked.
+- `flash_reader` stays `null`, so `capture --flash --assume-x70-values` still
+  refuses before any USB command and names `flash_reader`. The reader hash pin,
+  static screen, twice-read/verify and cleanup checks are untouched.
+- Before doing anything the tool prints a loud multi-line WARNING (values
+  unverified/borrowed from the X70; a wrong gate/guard address can crash, hang
+  or reset the camera; pull the battery to recover; owner's informed choice).
+- The manifest records `assumed_x70_values` (the three facts + provenance), so
+  any dump is labelled as captured under unverified parameters. The dry run
+  prints the warning and a note that it CANNOT confirm the values — only the
+  real camera can, so the first real run is the test.
+
+**What still blocks the flash backup.** Unchanged from U13: no reviewed X-E2
+EXR II reader image is pinned in the repo (`flash_reader` unlocated). The
+override deliberately does not supply one. Pinning a reviewed reader (build it
+with the `flash_reader_build` example, drop `flash-reader.json/.bin` beside the
+facts, set `flash_reader` high) is the separate step; `build.rs` then verifies
+hashes + static screen.
+
+**Checks.** `cargo test -p fujimod-xe2-capture` 27/27 (20 prior + 7 new:
+honest-facts-stay-unlocated-and-refuse; override-injects-only-the-three;
+capture-labels-manifest; override-does-not-bypass-identity/code;
+override-policy-blocks-non-gate-writes; override-does-not-unblock-flash;
+override-inputs-reject-bad-shapes). `cargo test -p fujimod-workflows --features
+fujimod-workflows/service-capture service_capture` 11/11. `cargo clippy
+--all-targets` clean. CLI verified offline: `plan`/`dry-run`/`capture` refuse
+without the flag; with it the state dump is `[ready]`, `--flash` still
+`[REFUSED]` naming `flash_reader`; bad flag combinations give the usage error.
+Did not touch any physical camera or USB device and did not contact
+fujimod.com. Firmware DAT not committed.
 
 ### U14 findings — emulator trace of xe2-411 service facts
 
