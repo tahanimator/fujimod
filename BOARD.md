@@ -15,7 +15,7 @@ touches a physical camera.
 
 | Unit | Stage(s) in progress file | Status | Owner | Models used | Result / notes |
 |---|---|---|---|---|---|
-| U0 | Toolchain bootstrap; document how a stage is refreshed from stale to pass | todo | | | |
+| U0 | Toolchain bootstrap; document how a stage is refreshed from stale to pass | done | U0-worker | Sonnet 5.5 (no subagents) | Toolchain built and shared (see Refresh procedure). No generator/runner for progress or catalog facts exists in this repo, so no stage can be flipped from here; facts files for xe2 4.11 already exist and validate. |
 | U1 | Bulk read source located; Flash reader located | todo | | | |
 | U2 | State-dump regions located; USB restart request located | todo | | | |
 | U3 | Optional card file access located | todo | | | |
@@ -26,4 +26,49 @@ touches a physical camera.
 
 ## Worker notes
 
-U0 records the refresh procedure here for everyone else.
+### Refresh procedure (U0)
+
+**Finding: the stage runner is not in this repository.** `catalog/progress/xe2/4.11/progress.generated.json`
+is a *recorded ledger* written by an external bring-up runner (the x70view research
+tooling the upstream docs mention). `crates/catalog/src/progress.rs` only defines and validates the
+document ("a result whose inputs changed since it was recorded is `stale`"). Nothing here (mise tasks,
+`scripts/`, `crates/catalog*`, `crates/corpus`, `bindings/python`, CI) writes it, and no path in the repo
+takes a local `.DAT` for stage grading. The same stages are stale in nearly every firmware's file
+(including x70 1.10), so `stale` marks a runner-side input change, not missing facts. Do not hand-edit
+`*.generated.*`. Consequences for workers:
+- The ten fact files in `catalog/firmware/xe2/4.11/` (`bulk`, `flash`, `state`, `restart`, `card-files`,
+  `control-ids`, `settings`, `boot-patch`, `memory-reservations`, `sd-boot-v2-autostart`, plus ui-*) already
+  exist, and `catalog/generation.generated.json` reports every xe2-411 table as `available`
+  (only `first-start` and `service` are `unavailable`, with reasons recorded there). So U1-U5 are
+  verification/regeneration of existing facts, not first-time research; any change needs the missing runner
+  or a hand-authored change to the generator inputs, which must be raised to the owner.
+- Facts are validated in-repo by `cargo test -p fujimod-catalog -p fujimod-catalog-schemas
+  --features fujimod-catalog-schemas/schema` (passes: 20 unit + integration tests, schema check of every
+  catalog document incl. progress). Schemas regenerate with
+  `cargo run -p fujimod-catalog-schemas --features schema --bin catalog-schemas -- --write` (`--check` verifies).
+- Building blocks that do exist for analysis: `fujimod.firmware` (decode/scan/outer_header/overlays) and
+  `fujimod.corpus` (Index/Store, locators) in the Python extension; `cargo run -p fujimod-firmware --bin
+  fujimod-decompress`; `crates/corpus/examples/capture_facts.rs` (JSON-lines flash/boot-ROM locator driver
+  over a corpus store, needs a prebuilt index); `fujimod-emulator boot --configuration ID --update DAT`.
+- Emulator stages (`sd-boot-v2-*`) need a real 16 KiB X70 boot ROM dump (sha256 `4ecedfbf...f9be`, per
+  firmware.json `boot_rom`; `progress.boot_rom` is `X70`) supplied via `--boot-rom`. None exists on this
+  machine, and the CLI refuses without it; also `fujimod-emulator boot` currently supports only the
+  `x70-110-*` configs ("xe2-411 declares no startup inputs").
+
+**Toolchain state (shared, reuse as is; build outputs are in the default `target/` and `.venv/`):**
+- Rust: pinned `nightly-2026-10-10` cannot be installed (`static.rust-lang.org` is blocked by the egress
+  policy, so `rustup toolchain install` fails). Stable rustc 1.97.0 builds and tests the catalog and emulator
+  fine; use plain `cargo ... --locked`. `rustfmt`/`clippy` nightly-only checks and wasm builds are unavailable.
+- `pnpm install --frozen-lockfile` done (node 22.23 is used instead of pinned 26; pnpm 12.18.0 matches).
+- Submodule initialised: `git submodule update --init crates/emulator-cpu-unicorn/vendor/unicorn`
+  (GitHub works; needed by the emulator CPU backend).
+- Built: `cargo build --locked --release -p fujimod-emulator-cli --bin fujimod-emulator` (about 10 min on
+  2 cores, output `target/release/fujimod-emulator`); `cargo build --locked -p fujimod-catalog` (about 1 min).
+- Python: `uv python install 3.14` (uv here is 0.11.32 and does not know 3.14.8; 3.14.6 is used),
+  `uv sync --locked --python 3.14`, `apt-get update && apt-get install -y libjpeg-dev pkg-config`
+  (needed by `fujimod-python-host-image`), then `uv run --locked python scripts/python_extension.py`
+  (about 8 min) installs `bindings/python/python/fujimod/_native.abi3.so` (git-ignored). Check with
+  `uv run --locked python -c "import fujimod.corpus, fujimod.firmware, fujimod.catalog"`.
+- Gotchas: only 2 CPUs and 7 GB RAM, so run one heavy cargo build at a time (concurrent builds only
+  contend). mise is not installed; mise tasks in `mise.toml` map directly to the commands shown. Run
+  Python that touches the DAT with `uv run --locked python -I`; the DAT is read-only (`/home/claude/fw`).
