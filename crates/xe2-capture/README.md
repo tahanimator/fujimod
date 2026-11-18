@@ -32,6 +32,45 @@ When the three facts are added to the facts file with high confidence and
 evidence, `capture` runs with no code change. `capture --flash` also needs
 the pinned reader (see "Pinning the reader" below).
 
+## Running with assumed X70 values (`--assume-x70-values`)
+
+The X70 and the X-E2 share the EXR II processor, so the owner may choose to try
+the X70 1.10 values for the three unlocated facts on the X-E2. The flag
+`--assume-x70-values` does exactly that, and nothing more:
+
+- It injects, for this run only, the X70 1.10 values for `read_gate`
+  (configuration-RAM offset `0xf7` = 1), `reset_guard` (offset `0xa3` = 1) and
+  `slow_read_bytes` (256). They come from the inputs file
+  `facts/xe2-411-service-facts.x70-assumed.json`, which records where each one
+  was taken from in the repo and marks all three "UNVERIFIED: borrowed from
+  x70-110".
+- The honest facts file `facts/xe2-411-service-facts.json` is **not** changed:
+  those three facts stay `null` / unverified. The override is a separate inputs
+  file and a flag, never a fact.
+- It supplies **only** those three numeric values. Every other safety gate is
+  untouched: the identity checks (`04cb:ff80`, product `X-E2`, internal version
+  `3.05`) and the stock-code hash checks still run before any write; the write
+  allowlist, the read-only reader hash pin, the twice-read/verify and the
+  cleanup checks are all unchanged.
+- Before doing anything, the tool prints a loud multi-line WARNING: the values
+  are unverified and borrowed from the X70; a wrong RAM gate or guard address
+  on the real X-E2 can crash, hang or reset the camera; pull the battery to
+  recover; and proceeding is the owner's informed choice.
+- Any dump captured this way is labelled in `manifest.json`
+  (`assumed_x70_values`) with the three facts and their provenance, so it is
+  never mistaken for a capture under confirmed X-E2 facts.
+
+**A dry run cannot confirm the values.** `dry-run --assume-x70-values` sends
+nothing to the camera, so it cannot tell whether the borrowed addresses are
+correct for the X-E2 — only the real camera reveals that. Treat the first real
+`capture --assume-x70-values` as the actual test of these values, and be ready
+to pull the battery.
+
+**`--flash` stays blocked.** The override supplies no reader image, so
+`capture DIR --flash --assume-x70-values` still refuses the flash backup and
+names `flash_reader`. The whole-flash backup needs a reviewed reader pinned by
+hash (see "Pinning the reader"), which is a separate step.
+
 ## The flash backup
 
 The X-E2's flash is raw NAND with no memory-mapped window, so it can only be
@@ -146,32 +185,54 @@ manifest, and both bytes clear when the battery comes out. The tool:
    target\release\fujimod-xe2-capture.exe dry-run
    ```
 
+   With the honest facts the plan shows the state dump `[REFUSED]` naming the
+   three unlocated facts. To try the X70 1.10 values, add the flag — the tool
+   prints the WARNING first, then the plan with the state dump `[ready]`:
+
+   ```
+   target\release\fujimod-xe2-capture.exe dry-run --assume-x70-values
+   ```
+
    Go on only if it shows `X-E2`, internal version `3.05`, and
-   `audited ... FF80 commands: all read-only`.
-6. Capture into a new folder (once the facts above are located):
+   `audited ... FF80 commands: all read-only`. Remember a dry run **cannot**
+   confirm the assumed values are right for the X-E2; the first real capture is
+   the actual test.
+6. Capture into a new folder. With the assumed X70 values, read the WARNING,
+   then run:
 
    ```
-   target\release\fujimod-xe2-capture.exe capture xe2-capture-2026-11-18
+   target\release\fujimod-xe2-capture.exe capture xe2-capture-2026-11-18 --assume-x70-values
    ```
 
-   The folder gets `dram.bin`, `boot-rom.bin` and `manifest.json`. The DRAM
+   (Without `--assume-x70-values` this refuses until the three facts are located
+   on the X-E2.) The folder gets `dram.bin`, `boot-rom.bin` and `manifest.json`;
+   when the override was used, `manifest.json` lists `assumed_x70_values` so the
+   dump is clearly labelled as captured under unverified parameters. The DRAM
    dump is 512 MiB, so keep the PC awake and the cable still. If the boot ROM
-   reads as all zero or all `0xff`, it is masked, not saved.
-7. To back up the flash as well (once the reader is pinned), add `--flash`
-   to the same command, with a new folder:
+   reads as all zero or all `0xff`, it is masked, not saved. **This first real
+   run is the test of the borrowed values: if the camera stops responding or
+   reboots, pull the battery (step 8).**
+7. To back up the flash as well, add `--flash` to the same command, with a new
+   folder:
 
    ```
-   target\release\fujimod-xe2-capture.exe capture xe2-capture-2026-11-18 --flash
+   target\release\fujimod-xe2-capture.exe capture xe2-capture-2026-11-18 --flash --assume-x70-values
    ```
 
-   After the state capture it reads the 128 MiB flash twice into `flash.bin`
-   and adds a `flash` section to `manifest.json` (SHA-256, reader hashes,
-   bootstrap address and cleanup checks). It ends with "upload area
-   restored". If it stops with "cleanup incomplete" or "NOT restored", the
-   leftovers are in RAM only: pull the battery as below.
+   This is still **blocked** today: `--assume-x70-values` does not supply a
+   reader image, so the flash step refuses and names `flash_reader`. The
+   whole-flash backup needs a reviewed reader pinned by hash (see "Pinning the
+   reader"), a separate step from the three service values. Once the reader is
+   pinned, the flash phase reads the 128 MiB flash twice into `flash.bin` and
+   adds a `flash` section to `manifest.json` (SHA-256, reader hashes, bootstrap
+   address and cleanup checks). It ends with "upload area restored". If it stops
+   with "cleanup incomplete" or "NOT restored", the leftovers are in RAM only:
+   pull the battery as below.
 8. **Pull the battery to leave service mode.** Never use the OFF switch: a
    normal shutdown in service mode can restore factory defaults. Unplug USB,
-   put the battery back, and switch on normally.
+   put the battery back, and switch on normally. If a run with
+   `--assume-x70-values` made the camera crash, hang or reset, pulling the
+   battery is also how you recover it.
 
 ## Tests
 
@@ -195,4 +256,11 @@ the write policy to every command. They cover:
 - a modified reader image or artifact is rejected, and images with a possible
   flash write path are rejected by the static screen even when pinned;
 - the flash-phase policy blocks every flash, firmware, configuration and
-  stored write, and a failed cleanup is reported with what was left.
+  stored write, and a failed cleanup is reported with what was left;
+- the honest facts file keeps the three values unlocated and capture refuses
+  without the flag; with `--assume-x70-values` the override injects only those
+  three facts (identity, code checks and the flash reader unchanged), the state
+  dump runs and the manifest records the assumed provenance; identity and
+  stock-code mismatches still abort under the override; the write allowlist
+  still blocks every non-gate write; and `--flash` still refuses naming the
+  reader.

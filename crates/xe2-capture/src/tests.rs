@@ -1286,3 +1286,205 @@ fn reader_screen_covers_every_exr2_controller_block() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Opt-in X70-assumed override (U15). Without the flag capture refuses; with it
+// the three borrowed values are injected, but every other gate is unchanged.
+// ---------------------------------------------------------------------------
+use crate::facts::{AssumedX70Values, X70_ASSUMED_MARK};
+
+/// Honest bundled facts with the bundled X70 override applied, exactly as the
+/// CLI does behind `--assume-x70-values`.
+fn assumed() -> ServiceFacts {
+    let mut f = ServiceFacts::bundled();
+    AssumedX70Values::bundled()
+        .unwrap()
+        .apply_to(&mut f)
+        .unwrap();
+    f
+}
+fn gate_policy(facts: &ServiceFacts) -> Policy {
+    Policy {
+        read_gate: facts.read_gate.value,
+        reset_guard: facts.reset_guard.value,
+    }
+}
+
+#[test]
+fn honest_facts_file_keeps_the_three_values_unlocated_and_refuses() {
+    // The checked-in facts file is never altered by the override: the three
+    // facts stay null / unlocated, so capture refuses without the flag.
+    let f = ServiceFacts::bundled();
+    assert!(f.read_gate.value.is_none());
+    assert!(f.reset_guard.value.is_none());
+    assert!(f.slow_read_bytes.value.is_none());
+    for c in [
+        f.read_gate.confidence,
+        f.reset_guard.confidence,
+        f.slow_read_bytes.confidence,
+    ] {
+        assert_eq!(c, Confidence::Unlocated);
+    }
+    assert!(f.assumed_x70().is_empty());
+    let run = capture(&f, &camera(Policy::read_only()), USB);
+    assert!(matches!(run.result, Err(Error::Missing(_))));
+}
+
+#[test]
+fn override_injects_only_the_three_assumed_facts_marked_unverified() {
+    let honest = ServiceFacts::bundled();
+    let a = assumed();
+    assert_eq!(
+        a.read_gate.value,
+        Some(RamByte {
+            offset: 0xf7,
+            enabled_value: 1
+        })
+    );
+    assert_eq!(
+        a.reset_guard.value,
+        Some(RamByte {
+            offset: 0xa3,
+            enabled_value: 1
+        })
+    );
+    assert_eq!(a.slow_read_bytes.value, Some(256));
+    for ev in [
+        &a.read_gate.evidence,
+        &a.reset_guard.evidence,
+        &a.slow_read_bytes.evidence,
+    ] {
+        assert!(ev.starts_with(X70_ASSUMED_MARK), "{ev}");
+    }
+    let names: Vec<_> = a.assumed_x70().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["read_gate", "reset_guard", "slow_read_bytes"]);
+    // Nothing else moved: identity, code checks and the flash reader are the
+    // honest facts, untouched. The override supplies only the three bytes.
+    assert_eq!(a.service_usb.value, honest.service_usb.value);
+    assert_eq!(a.product.value, honest.product.value);
+    assert_eq!(a.internal_version.value, honest.internal_version.value);
+    assert_eq!(a.code_checks.value, honest.code_checks.value);
+    assert!(a.flash_reader.value.is_none());
+}
+
+#[test]
+fn capture_with_the_override_dumps_state_and_labels_the_manifest() {
+    let facts = assumed();
+    let c = camera(gate_policy(&facts));
+    let run = capture(&facts, &c, USB);
+    let manifest = run.result.expect("capture under override");
+    let camera = c.lock().unwrap();
+    assert!(camera.violations.is_empty(), "{:?}", camera.violations);
+    // Only the two assumed gate bytes are written, at the X70 offsets.
+    assert_eq!(camera.configuration_writes, [(0xf7, 1), (0xa3, 1)]);
+    // The dump is labelled as captured under unverified X70 values.
+    let names: Vec<_> = manifest.assumed_x70_values.iter().map(|a| a.fact).collect();
+    assert_eq!(names, ["read_gate", "reset_guard", "slow_read_bytes"]);
+    assert!(
+        manifest
+            .assumed_x70_values
+            .iter()
+            .all(|a| a.provenance.starts_with(X70_ASSUMED_MARK))
+    );
+    let names: Vec<_> = run.saved.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["dram", "boot-rom"]);
+}
+
+#[test]
+fn override_does_not_bypass_identity_or_stock_code_checks() {
+    let facts = assumed();
+    // Product mismatch still aborts before any write, even with the override.
+    let c = camera(gate_policy(&facts));
+    c.lock().unwrap().product = "X-T1".into();
+    let run = capture(&facts, &c, USB);
+    assert!(matches!(run.result, Err(Error::Identity(_))));
+    assert!(c.lock().unwrap().configuration_writes.is_empty());
+    assert!(!c.lock().unwrap().commands.contains(&policy::MEMORY));
+    // USB id mismatch still aborts.
+    let c = camera(gate_policy(&facts));
+    let run = capture(
+        &facts,
+        &c,
+        UsbIds {
+            vendor_id: 0x04cb,
+            product_id: 0x02e5,
+        },
+    );
+    assert!(matches!(run.result, Err(Error::Identity(_))));
+    assert!(c.lock().unwrap().configuration_writes.is_empty());
+    // Changed stock code still aborts before any write.
+    let c = camera(gate_policy(&facts));
+    let first = bulk().code_checks[3].address as u32;
+    c.lock().unwrap().corrupt = Some(first + 5);
+    let run = capture(&facts, &c, USB);
+    assert!(matches!(run.result, Err(Error::CodeDiffers(_))));
+    assert!(c.lock().unwrap().configuration_writes.is_empty());
+    assert!(run.saved.is_empty());
+}
+
+#[test]
+fn override_write_policy_still_blocks_every_non_gate_write() {
+    let p = gate_policy(&assumed());
+    let ram = |offset, value| command(policy::CONFIGURATION, 3, [1, 0, offset, 1], &[value]);
+    // Only the two assumed gates, and only their enabled / restore values.
+    assert!(p.check(&ram(0xf7, 1)).is_ok());
+    assert!(p.check(&ram(0xf7, 0)).is_ok(), "read gate restore");
+    assert!(p.check(&ram(0xa3, 1)).is_ok());
+    assert!(p.check(&ram(0xa3, 0)).is_err(), "guard is never cleared");
+    assert!(p.check(&ram(0xf7, 2)).is_err());
+    assert!(p.check(&ram(0x20, 1)).is_err(), "other RAM bytes");
+    let stored = command(policy::CONFIGURATION, 3, [0, 0, 0xf7, 1], &[1]);
+    assert!(p.check(&stored).is_err(), "stored configuration");
+    let memory_write = command(policy::MEMORY, 3, [0, 0, 0x4000_0000, 1], &[0]);
+    assert!(p.check(&memory_write).is_err());
+    for code in [0x660002, 0x550001, 0x760001, 0x110000, 0x2a0001] {
+        assert!(p.check(&command(code, 0, [0; 4], &[])).is_err(), "{code:#x}");
+    }
+}
+
+#[test]
+fn override_does_not_unblock_the_flash_backup() {
+    // State dump is ready, but the flash step still refuses naming the reader:
+    // the override supplies no flash_reader, so --flash stays blocked.
+    let facts = assumed();
+    let (bulk, state) = (bulk(), state());
+    let plan = Inputs {
+        facts: &facts,
+        bulk: &bulk,
+        state: &state,
+        flash: None,
+        reader: None,
+    }
+    .plan();
+    assert!(plan.iter().find(|s| s.name == "dump camera state").unwrap().ready);
+    let flash = plan
+        .iter()
+        .find(|s| s.name.starts_with("back up flash"))
+        .unwrap();
+    assert!(!flash.ready);
+    assert!(flash.refused_because.iter().any(|m| m.fact == "flash_reader"));
+    // Nothing is embedded at build time, and the honest facts pin no reader.
+    assert!(crate::flash::BUNDLED_READER.is_none());
+}
+
+#[test]
+fn override_inputs_reject_a_missing_mark_wrong_firmware_or_colliding_gates() {
+    assert!(AssumedX70Values::bundled().is_ok());
+    // Provenance must carry the unverified mark.
+    let mut doc: serde_json::Value =
+        serde_json::from_str(facts::XE2_411_X70_ASSUMED).unwrap();
+    doc["read_gate"]["provenance"] = "located on the X-E2".into();
+    assert!(AssumedX70Values::from_json(&doc.to_string()).is_err());
+    // Must be for xe2-411, borrowed from x70-110.
+    let mut doc: serde_json::Value =
+        serde_json::from_str(facts::XE2_411_X70_ASSUMED).unwrap();
+    doc["firmware_id"] = "x70-110".into();
+    assert!(AssumedX70Values::from_json(&doc.to_string()).is_err());
+    // An override that collides the two gate offsets is refused on apply.
+    let mut doc: serde_json::Value =
+        serde_json::from_str(facts::XE2_411_X70_ASSUMED).unwrap();
+    doc["reset_guard"]["value"] = serde_json::json!({"offset": 247, "enabled_value": 1});
+    let bad = AssumedX70Values::from_json(&doc.to_string()).unwrap();
+    let mut f = ServiceFacts::bundled();
+    assert!(bad.apply_to(&mut f).is_err());
+}

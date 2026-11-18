@@ -3,7 +3,17 @@ use serde::{Deserialize, Serialize};
 
 /// The checked-in X-E2 4.11 facts. Hand-authored, never generated.
 pub const XE2_411: &str = include_str!("../facts/xe2-411-service-facts.json");
+/// The opt-in override inputs: the X70 1.10 values for the three unlocated
+/// facts, injected only behind the `--assume-x70-values` flag. Not facts.
+pub const XE2_411_X70_ASSUMED: &str =
+    include_str!("../facts/xe2-411-service-facts.x70-assumed.json");
 pub const FIRMWARE_ID: &str = "xe2-411";
+/// The firmware the assumed values are borrowed from.
+pub const X70_ASSUMED_SOURCE: &str = "x70-110";
+/// The evidence prefix every assumed fact carries, so a run that used the
+/// override is recognisable in the manifest and never mistaken for a located
+/// fact. The override must never be written into the honest facts file.
+pub const X70_ASSUMED_MARK: &str = "UNVERIFIED: borrowed from x70-110";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -156,12 +166,21 @@ impl ServiceFacts {
         if facts.code_checks.value.as_deref() != Some("catalog:bulk.code_checks") {
             return Err("code_checks must name catalog:bulk.code_checks".into());
         }
-        if let (Some(gate), Some(guard)) = (&facts.read_gate.value, &facts.reset_guard.value)
+        facts.check_invariants()?;
+        Ok(facts)
+    }
+
+    /// Shape checks that must hold for any value of the located facts, however
+    /// they were set. Run at parse time and again after the opt-in override
+    /// injects the three assumed X70 values, so an unsafe shape is refused
+    /// whether it comes from the facts file or from the override inputs.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        if let (Some(gate), Some(guard)) = (&self.read_gate.value, &self.reset_guard.value)
             && gate.offset == guard.offset
         {
             return Err("read gate and reset guard must be different bytes".into());
         }
-        for gate in [&facts.read_gate.value, &facts.reset_guard.value]
+        for gate in [&self.read_gate.value, &self.reset_guard.value]
             .into_iter()
             .flatten()
         {
@@ -169,19 +188,138 @@ impl ServiceFacts {
                 return Err("an enabled RAM gate value must be nonzero".into());
             }
         }
-        if facts
-            .slow_read_bytes
-            .value
-            .is_some_and(|n| n == 0 || n > 4096)
-        {
+        if self.slow_read_bytes.value.is_some_and(|n| n == 0 || n > 4096) {
             return Err("slow_read_bytes must be 1..=4096".into());
         }
-        if let Some(reader) = &facts.flash_reader.value {
+        if let Some(reader) = &self.flash_reader.value {
             reader.validate()?;
         }
-        Ok(facts)
+        Ok(())
     }
     pub fn bundled() -> Self {
         Self::from_json(XE2_411).expect("checked-in facts parse")
+    }
+
+    /// The located facts that were supplied by the X70 override, not located
+    /// on the X-E2: high-confidence facts whose evidence carries the
+    /// [`X70_ASSUMED_MARK`]. Empty when the honest facts are in force.
+    pub fn assumed_x70(&self) -> Vec<(&'static str, String)> {
+        [
+            ("read_gate", &self.read_gate.confidence, &self.read_gate.evidence),
+            (
+                "reset_guard",
+                &self.reset_guard.confidence,
+                &self.reset_guard.evidence,
+            ),
+            (
+                "slow_read_bytes",
+                &self.slow_read_bytes.confidence,
+                &self.slow_read_bytes.evidence,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, conf, ev)| **conf == Confidence::High && ev.starts_with(X70_ASSUMED_MARK))
+        .map(|(name, _, ev)| (name, ev.clone()))
+        .collect()
+    }
+}
+
+/// One borrowed value and where it came from. The provenance must begin with
+/// [`X70_ASSUMED_MARK`]; the X70 source names the in-repo evidence.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssumedByte {
+    pub value: RamByte,
+    pub provenance: String,
+    pub x70_source: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssumedSize {
+    pub value: u32,
+    pub provenance: String,
+    pub x70_source: String,
+}
+fn assumed_evidence(provenance: &str, x70_source: &str) -> String {
+    format!("{provenance} | X70 1.10 source: {x70_source}")
+}
+
+/// The opt-in override inputs: the X70 1.10 values for the three facts the
+/// X-E2 analysis never located. These are not facts and are never written into
+/// the honest facts file; they are injected into a live [`ServiceFacts`] only
+/// when the user passes `--assume-x70-values`, and only for these three bytes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssumedX70Values {
+    pub format: u32,
+    pub about: String,
+    pub firmware_id: String,
+    pub borrowed_from: String,
+    pub read_gate: AssumedByte,
+    pub reset_guard: AssumedByte,
+    pub slow_read_bytes: AssumedSize,
+}
+
+impl AssumedX70Values {
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let v: Self = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if v.format != 1 {
+            return Err(format!("unsupported assumed-values format {}", v.format));
+        }
+        if v.firmware_id != FIRMWARE_ID {
+            return Err(format!(
+                "assumed values are for {}, this tool supports only {FIRMWARE_ID}",
+                v.firmware_id
+            ));
+        }
+        if v.borrowed_from != X70_ASSUMED_SOURCE {
+            return Err(format!(
+                "assumed values claim to be borrowed from {}, not {X70_ASSUMED_SOURCE}",
+                v.borrowed_from
+            ));
+        }
+        for (name, provenance) in [
+            ("read_gate", &v.read_gate.provenance),
+            ("reset_guard", &v.reset_guard.provenance),
+            ("slow_read_bytes", &v.slow_read_bytes.provenance),
+        ] {
+            if !provenance.starts_with(X70_ASSUMED_MARK) {
+                return Err(format!(
+                    "assumed {name} provenance must begin with {X70_ASSUMED_MARK:?}"
+                ));
+            }
+        }
+        Ok(v)
+    }
+
+    pub fn bundled() -> Result<Self, String> {
+        Self::from_json(XE2_411_X70_ASSUMED)
+    }
+
+    /// Inject the three borrowed values into a live `ServiceFacts`, as
+    /// high-confidence facts whose evidence carries the assumed mark. Only
+    /// these three bytes are touched; identity, code checks and the flash
+    /// reader are left exactly as the honest facts file has them. The shared
+    /// invariants are re-checked afterwards.
+    pub fn apply_to(&self, facts: &mut ServiceFacts) -> Result<(), String> {
+        facts.read_gate = Fact {
+            value: Some(self.read_gate.value),
+            confidence: Confidence::High,
+            evidence: assumed_evidence(&self.read_gate.provenance, &self.read_gate.x70_source),
+        };
+        facts.reset_guard = Fact {
+            value: Some(self.reset_guard.value),
+            confidence: Confidence::High,
+            evidence: assumed_evidence(&self.reset_guard.provenance, &self.reset_guard.x70_source),
+        };
+        facts.slow_read_bytes = Fact {
+            value: Some(self.slow_read_bytes.value),
+            confidence: Confidence::High,
+            evidence: assumed_evidence(
+                &self.slow_read_bytes.provenance,
+                &self.slow_read_bytes.x70_source,
+            ),
+        };
+        facts.check_invariants()
     }
 }

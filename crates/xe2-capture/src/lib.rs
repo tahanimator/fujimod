@@ -46,6 +46,35 @@ use std::num::NonZeroU32;
 pub const BATTERY_REMINDER: &str = "Exit service mode by pulling the battery. Never use the OFF switch: \
      a normal shutdown in service mode can restore factory defaults.";
 
+/// The loud, multi-line warning printed before anything else when the
+/// `--assume-x70-values` override is in force. It names what is borrowed, the
+/// physical risk, the recovery, and that this is the owner's informed choice.
+pub const X70_ASSUMED_WARNING: &str = "\
+====================================================================
+  WARNING: RUNNING WITH UNVERIFIED, ASSUMED X70 SERVICE VALUES
+====================================================================
+  read_gate, reset_guard and slow_read_bytes are NOT located on the
+  X-E2. They are borrowed UNCHANGED from the X70 1.10 firmware, on the
+  assumption that the shared EXR II processor uses the same values.
+  They have NOT been confirmed on the X-E2.
+
+  If a borrowed RAM gate or guard ADDRESS is wrong for the real X-E2,
+  writing it can CRASH, HANG or RESET the camera, or reset it to
+  factory defaults. This is a real risk, not a theoretical one.
+
+  If the camera misbehaves, stops responding, or reboots: PULL THE
+  BATTERY to power it down. Do NOT use the OFF switch.
+
+  Proceeding is the owner's informed choice. Any dump produced this way
+  is labelled in its manifest as captured under assumed X70 values.
+====================================================================";
+
+/// What the dry run can and cannot tell you about the assumed values.
+pub const X70_ASSUMED_DRY_RUN_NOTE: &str =
+    "A dry run sends nothing to the camera, so it CANNOT confirm that the assumed X70 values are \
+     correct for the X-E2. Only a real run reveals that. Treat the first real capture as the \
+     actual test of these values, and be ready to pull the battery.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -125,11 +154,25 @@ pub struct RegionRecord {
     pub masked: bool,
 }
 
+/// One located fact that was supplied by the X70 override rather than located
+/// on the X-E2, recorded in the manifest so any dump is clearly labelled as
+/// captured under unverified parameters.
+#[derive(Clone, Debug, Serialize)]
+pub struct AssumedFact {
+    pub fact: &'static str,
+    pub provenance: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Manifest {
     pub tool: &'static str,
     pub firmware_id: String,
     pub firmware_sha256: String,
+    /// Non-empty when the run used `--assume-x70-values`: the three borrowed
+    /// facts and their provenance. A dump with this field was captured under
+    /// unverified X70 values, not confirmed X-E2 facts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assumed_x70_values: Vec<AssumedFact>,
     pub identity: Identity,
     pub gates: Vec<GateRecord>,
     pub code_checks: Vec<String>,
@@ -151,6 +194,12 @@ pub struct DryRun {
     pub reset_guard_current: Option<u8>,
     pub code_checks: String,
     pub plan: Vec<Step>,
+    /// Non-empty when the dry run used `--assume-x70-values`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assumed_x70_values: Vec<AssumedFact>,
+    /// Present with the override: the dry run cannot confirm the assumed values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assumed_note: Option<&'static str>,
     pub reminder: &'static str,
 }
 
@@ -199,6 +248,16 @@ impl Inputs<'_> {
         self.bulk.validate().map_err(Error::Refused)?;
         self.state.validate().map_err(Error::Refused)?;
         Ok(())
+    }
+
+    /// The located facts the current run took from the X70 override, for the
+    /// manifest and the dry-run report. Empty under the honest facts.
+    pub fn assumed_x70(&self) -> Vec<AssumedFact> {
+        self.facts
+            .assumed_x70()
+            .into_iter()
+            .map(|(fact, provenance)| AssumedFact { fact, provenance })
+            .collect()
     }
 
     fn policy(&self) -> policy::Policy {
@@ -475,12 +534,16 @@ impl Inputs<'_> {
             Err(Error::Missing(m)) => format!("not run: missing {}", names(&m)),
             Err(error) => return Err(error),
         };
+        let assumed_x70_values = self.assumed_x70();
+        let assumed_note = (!assumed_x70_values.is_empty()).then_some(X70_ASSUMED_DRY_RUN_NOTE);
         Ok(DryRun {
             identity,
             read_gate_current,
             reset_guard_current,
             code_checks,
             plan: self.plan(),
+            assumed_x70_values,
+            assumed_note,
             reminder: BATTERY_REMINDER,
         })
     }
@@ -627,6 +690,7 @@ impl Inputs<'_> {
             tool: concat!("fujimod-xe2-capture ", env!("CARGO_PKG_VERSION")),
             firmware_id: self.facts.firmware_id.clone(),
             firmware_sha256: self.facts.firmware_sha256.clone(),
+            assumed_x70_values: self.assumed_x70(),
             identity,
             gates,
             code_checks: self

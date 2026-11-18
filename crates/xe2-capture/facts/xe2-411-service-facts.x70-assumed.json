@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "about": "OPT-IN OVERRIDE INPUTS, NOT FACTS. Separate from xe2-411-service-facts.json, which stays honest (read_gate, reset_guard and slow_read_bytes null / unverified). These three values are the X70 1.10 (x70-110) service values, borrowed unchanged for the X-E2 because the two bodies share the EXR II processor. They are UNVERIFIED for the X-E2: no X-E2 4.11 code was found to show them (see the honest facts file's evidence, U9/U10/U11/U14). The tool injects them ONLY when run with the explicit --assume-x70-values flag, and prints a loud warning first. A wrong RAM gate/guard address on the real X-E2 can crash, hang or reset the camera. This file supplies the three numeric facts and nothing else: identity, stock-code and flash-reader checks are untouched, so capture --flash stays blocked until a reviewed reader image is pinned.",
+  "firmware_id": "xe2-411",
+  "borrowed_from": "x70-110",
+  "read_gate": {
+    "value": { "offset": 247, "enabled_value": 1 },
+    "provenance": "UNVERIFIED: borrowed from x70-110",
+    "x70_source": "X70 ServiceSetup fixture debug_offset=247 (0xf7) in crates/workflows/src/service_mode/tests.rs (identity.products=[\"X70\"]); consistent with crates/workflows/src/flash/exr2.rs configuration_flags reading RAM offset 0xf7 and require_debug_access requiring it == 1 (the X70 Dev Tools EXR II debug-read gate). Not confirmed on the X-E2."
+  },
+  "reset_guard": {
+    "value": { "offset": 163, "enabled_value": 1 },
+    "provenance": "UNVERIFIED: borrowed from x70-110",
+    "x70_source": "X70 ServiceSetup fixture guard {offset:163 (0xa3), value:1} in crates/workflows/src/service_mode/tests.rs (identity.products=[\"X70\"]); consistent with crates/workflows/src/flash/exr2.rs configuration_flags reading RAM offset 0xa3; catalog-workflows requires guard.value == 1. Not confirmed on the X-E2."
+  },
+  "slow_read_bytes": {
+    "value": 256,
+    "provenance": "UNVERIFIED: borrowed from x70-110",
+    "x70_source": "X70 ServiceSetup fixture configuration.memory_read_bytes=256 in crates/workflows/src/service_mode/tests.rs (identity.products=[\"X70\"]); the per-command EXR II debug-read size, which crates/catalog-workflows/src/lib.rs caps at 256. Not confirmed on the X-E2."
+  }
+}

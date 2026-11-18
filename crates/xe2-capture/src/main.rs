@@ -15,8 +15,8 @@ use fujimod_usb::{
     trace::Trace,
 };
 use fujimod_xe2_capture::{
-    BATTERY_REMINDER, Inputs,
-    facts::{FIRMWARE_ID, ServiceFacts, UsbIds},
+    BATTERY_REMINDER, Inputs, X70_ASSUMED_WARNING,
+    facts::{AssumedX70Values, FIRMWARE_ID, ServiceFacts, UsbIds},
     flash::Reader,
     policy::{Auditor, Policy},
 };
@@ -46,8 +46,32 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: &[String]) -> Result<(), Failure> {
-    let usage = "usage: fujimod-xe2-capture plan | dry-run | capture OUTPUT_DIR [--flash]";
-    let facts = ServiceFacts::bundled();
+    let usage = "usage: fujimod-xe2-capture plan | dry-run | capture OUTPUT_DIR \
+                 [--flash] [--assume-x70-values]";
+    // Separate the known flags from the positional command and its folder.
+    let mut flash = false;
+    let mut assume_x70 = false;
+    let mut positional: Vec<&str> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--flash" => flash = true,
+            "--assume-x70-values" => assume_x70 = true,
+            other if other.starts_with("--") => return Err(usage.into()),
+            other => positional.push(other),
+        }
+    }
+
+    // The honest facts leave read_gate, reset_guard and slow_read_bytes
+    // unlocated, so capture refuses. The opt-in override injects the X70 1.10
+    // values for exactly those three bytes and nothing else, and only after a
+    // loud warning. The facts file itself is never modified.
+    let mut facts = ServiceFacts::bundled();
+    if assume_x70 {
+        eprintln!("{X70_ASSUMED_WARNING}");
+        AssumedX70Values::bundled()
+            .and_then(|assumed| assumed.apply_to(&mut facts))
+            .map_err(|e| format!("could not apply the X70 override inputs: {e}"))?;
+    }
     let selected = ReferenceCatalog::bundled()?.resolve_firmware(FIRMWARE_ID)?;
     let bulk = selected.bulk.ok_or("catalog has no xe2-411 bulk facts")?;
     let state = selected
@@ -66,12 +90,16 @@ async fn run(args: &[String]) -> Result<(), Failure> {
         reader: reader.as_ref(),
     };
     inputs.validate()?;
-    match args.first().map(String::as_str) {
-        Some("plan") if args.len() == 1 => {
+    // `--flash` only makes sense for a capture; it is the dump that it extends.
+    if flash && positional.first() != Some(&"capture") {
+        return Err(usage.into());
+    }
+    match positional.first().copied() {
+        Some("plan") if positional.len() == 1 => {
             print_plan(&inputs);
             Ok(())
         }
-        Some("dry-run") if args.len() == 1 => {
+        Some("dry-run") if positional.len() == 1 => {
             let (mut session, usb, trace) = open().await?;
             let report = inputs.dry_run(&mut session, usb).await;
             let mut auditor = Auditor::new(Policy::read_only());
@@ -81,11 +109,13 @@ async fn run(args: &[String]) -> Result<(), Failure> {
             println!("audited {commands} FF80 commands: all read-only");
             println!("{}", serde_json::to_string_pretty(&report)?);
             print_plan(&inputs);
+            if let Some(note) = report.assumed_note {
+                println!("\nNOTE: {note}");
+            }
             Ok(())
         }
-        Some("capture") if args.len() == 2 => capture(&inputs, Path::new(&args[1]), false).await,
-        Some("capture") if args.len() == 3 && args[2] == "--flash" => {
-            capture(&inputs, Path::new(&args[1]), true).await
+        Some("capture") if positional.len() == 2 => {
+            capture(&inputs, Path::new(positional[1]), flash).await
         }
         _ => Err(usage.into()),
     }
