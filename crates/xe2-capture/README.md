@@ -176,6 +176,13 @@ manifest, and both bytes clear when the battery comes out. The tool:
 4. First time only: in **Zadig** (<https://zadig.akeo.ie>), choose Options >
    List All Devices, pick the `04CB FF80` device, choose **WinUSB** and click
    Install Driver. If Dev Tools already connects, this is done.
+   **One run per power-up.** The tool never closes its service session (a
+   clean close is untested on the X-E2 and may reach the stock teardown the
+   reset guard is meant to block), so the session stays open on the camera
+   after `dry-run` or `capture`. The next run then stops at once with "the
+   camera already has an open service session", before sending any command.
+   Pull the battery and re-enter service mode (steps 1-3) before every run,
+   including between the dry run and the capture.
 5. **Run the dry run first.** It identifies the camera, runs the stock code
    checks if the camera allows reads, prints the exact command plan
    (including, for the flash step, the bootstrap address, reader size and

@@ -51,8 +51,11 @@ open service session" (`crates/usb/src/ff80/session.rs` open reply `[0,0]`,
 packet 256). No command was sent and no write happened. Cause: `xe2-capture`
 calls `begin_session` but never closes the session, and `Session` drop sends no
 close, so the dry run's session stays open on the camera. Workaround: battery
-pull + re-entry before each run. Fix (todo): close the session after `dry-run` /
-`capture`, or `Connection::reclaim_session()` before opening.
+pull + re-entry before each run. Owner decision (2026-11-18): **keep the battery
+pull, no code fix.** A clean close (`Session::close`, C4) or
+`reclaim_session()` has never been sent to an X-E2. It may reach the stock
+teardown that restores defaults, and 0xa3 is unverified as the guard (unset
+during a dry run). Documented in `crates/xe2-capture/README.md`.
 
 **Capture, attempt 2** (after battery pull, no dry run first): exit 0, 182 FF80
 commands audited, all inside the policy. Manifest: `code_verified_before_any_write
