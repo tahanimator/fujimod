@@ -27,9 +27,83 @@ touches a physical camera.
 | U9 | Locate X-E2 service-mode power-on key combo in firmware | done | U9-worker | Opus | LOW confidence: no power-on button combo confirmed. Main firmware never samples UP(2) or S2(8) as held keys (is-key-held primitive 0x93F008 has 3 callers only: LENS_DET/PLAY/S1), so the x70/xe2s family combo (selector.up + full shutter) has no detection code in xe2-411 — consistent with the owner's failed USB test. `boot.service` NOT added to xe2 controls.json. See "U9 findings" below. |
 | U10 | Local read-only flash backup + state dumper for X-E2 4.11 (service mode) | review | U10-worker | Opus | Tool `crates/xe2-capture` (`fujimod-xe2-capture plan / dry-run / capture DIR`, Rust on nusb + WinUSB). Identity, dry run, policy and audit work now. State capture is refused until `read_gate`, `reset_guard` and `slow_read_bytes` are located (unlocated in `crates/xe2-capture/facts/xe2-411-service-facts.json`). Whole-flash backup is refused by policy: the only X-E2 NAND reader uploads and executes code. See "U10 findings". |
 | U11 | Locate xe2-411 service facts read_gate, reset_guard, slow_read_bytes | blocked | U11-worker | Opus | All three remain UNLOCATED: no X-E2 4.11 code directly shows the values and X70's 0xf7/0xa3 were not borrowed (guessing). Located the FF80 command infrastructure (dispatch table 0x146c024, descriptors 04cb:ff80, session struct 0x15434f0, parser 0x10c89c0) but did not isolate the 200001 read-handler gate/size or the teardown guard-byte to a high bar. Tool unchanged; gates intact; capture still correctly refused; tests 12/12 + workflows service_capture 11/11 pass. See "U11 findings". |
-| U13 | Flash backup via temporary RAM code in xe2-capture (owner-approved) | in-progress | U13-worker | Opus | Wiring the existing EXR II `exr2-query-heap` reader path (`fujimod_workflows::flash`) into `crates/xe2-capture` behind the same service-fact gates, a pinned reader hash, a static reader screen and a flash-scoped command policy. |
+| U13 | Flash backup via temporary RAM code in xe2-capture (owner-approved) | review | U13-worker | Opus | `fujimod-xe2-capture capture DIR --flash` (commit 95caadf) reuses `fujimod_workflows::flash::backup` (EXR II `exr2-query-heap`) unchanged: upload to a stock heap block in RAM, run, read NAND via the stock page reader, clean up; read twice, hashed, cleanup read back and reported. Still REFUSED before any USB command: read_gate/reset_guard/slow_read_bytes unlocated, AND no reviewed X-E2 reader image exists in the repo to pin (the reader source and staged flash-reader artifacts are external). Tests 20/20; workflows 87/87. See "U13 findings". |
 
 ## Worker notes
+
+### U13 findings — flash backup via temporary RAM code (owner-approved)
+
+**Outcome: implemented and tested against a mock camera; still refused for a
+real run.** `fujimod-xe2-capture capture DIR --flash` adds a whole-flash backup
+to `crates/xe2-capture` (new `src/flash.rs`, `src/reader_scan.rs`, `build.rs`).
+No camera code was written: the step hands the existing EXR II reader path,
+`fujimod_workflows::flash::backup` with transport `exr2-query-heap` (the X70
+Dev Tools mechanism), a reviewed reader pinned by hash, and adds gates around
+it. No physical camera/USB device was touched and nothing upstream was contacted.
+
+**What still blocks a real run (two independent blockers):**
+1. `read_gate`, `reset_guard`, `slow_read_bytes` are unlocated (U11). Not
+   located or guessed here. The flash step also requires the located gates to
+   agree with the offsets the reused path reads itself (`exr2.rs`
+   `configuration_flags`: debug 0xf7 must be 1, guard 0xa3); otherwise it
+   refuses naming the fact.
+2. **No reviewed X-E2 reader image exists in this repo.** The repo holds the
+   host side (`flash/exr2.rs`) and the xe2-411 flash contract, but
+   `build::prepare_exr2` links the image from an externally compiled reader
+   (`flash_reader_call`/`flash_reader`/`flash_reader_progress`) plus the corpus
+   `exr2_execution` locator and an index. Neither the reader source nor any
+   staged `flash-reader.json/.bin` (for any body) is checked in; Dev Tools
+   fetches them from the runtime site, which I did not contact. Someone must
+   build it from reviewed source (`flash_reader_build` example), drop the
+   artifact JSON + image into `crates/xe2-capture/facts/`, and pin
+   `flash_reader` (artifact/image sha256, size, review) at confidence high.
+   Note: the task's `crates/mod-install` does not exist; the closest is
+   `crates/runtime-install`. The exr2 path does its own checked upload and
+   ownership-checked cleanup, so no extra crate was needed.
+
+**Enforced in code:**
+- Refusal before any USB command unless every service fact, the pinned and
+  verified reader, the flash contract and the gate-offset agreement are present.
+- Reader verification at build time (`build.rs`: hashes, size, static screen;
+  build fails otherwise; only a verified pair is embedded) and at run time
+  (hashes, `Payload::validate` against the catalog, static screen, catalog
+  stock entries must be read-side: no program/erase/write/format names).
+- Static screen (`reader_scan.rs`, every A32 word): refuses direct branches out
+  of the uploaded code, BLX-immediate, SVC/SMC, coprocessor (cache/MPU/VFP),
+  MSR/CPS/SRS/RFE, and any literal or MOVT in EXR II peripheral space (covers
+  the NAND controller 0xfff52000 and DMA 0xfff02000; a test checks every SoC
+  block). It is a conservative screen, not a proof; the reviewed hash is the
+  primary guarantee, and a legitimate reader could trip it (e.g. VFP code),
+  which would refuse rather than run.
+- Before the upload: identity again, both RAM gates already enabled (the flash
+  phase never writes configuration), stock code checks, stock callback in place.
+- `FlashPolicy` for the phase (mock enforces it on the wire, CLI audits the
+  trace): RAM writes only in DRAM, 1 byte per command (no write size is located,
+  so the minimum is used), never over any pinned stock code; diagnostic queries;
+  reads. Configuration, stored, E0, firmware, restart, console and event
+  commands are refused.
+- Flash read twice; chunks compared by SHA-256 and the totals must match; the
+  CLI writes `flash.bin` at chunk offsets and re-hashes the file. Manifest gets
+  a `flash` section: size, sha256, chunks, uncorrectable pages, reader hashes,
+  bootstrap address, callback slot, per-pass cleanup.
+- Cleanup: after each pass the callback slot, bootstrap slot, bulk source state
+  and RAM gates are read back and compared with pre-upload values; residue is
+  named in the error with the battery-pull instruction. Known residue: the
+  freed heap block may still hold reader bytes until reused (RAM only).
+- Dry run / plan list the upload (bootstrap address, reader size, image and
+  artifact sha256, allocator/release entries, request/buffer offsets); the
+  heap address is chosen by the camera at run time, so it is listed as such.
+- Battery-pull reminder unchanged on every run.
+
+**Tests:** `cargo test -p fujimod-xe2-capture` 20/20 (8 new: full
+upload/run/read-twice/cleanup sequence on the extended mock, missing facts and
+missing reader refuse with zero USB commands, modified image/artifact rejected,
+unsafe images rejected even when pinned, no flash-write path in the phase
+policy or source, cleanup failure reported, dry-run upload listing, screen vs
+SoC). `cargo test -p fujimod-workflows --features fujimod-workflows/service-capture`
+87/87; `cargo test -p fujimod-usb` passes; clippy clean for the crate. Build
+gate checked manually with a temporary pin (bad hash and SVC image both fail
+the build), then reverted.
 
 ### U11 findings — xe2-411 read_gate / reset_guard / slow_read_bytes
 
