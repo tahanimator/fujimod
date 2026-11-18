@@ -59,6 +59,8 @@ struct Camera {
     source_state: u32,
     callback_offset: u32,
     stock_callback: u32,
+    /// Session closes (C4) received.
+    closes: u32,
 }
 impl Camera {
     fn byte(&self, address: u32) -> u8 {
@@ -102,6 +104,10 @@ impl Peer for Device {
         }
         match kind {
             RequestKind::Open => c.reply = vec![0x34, 0x12, 0, 0, 0, 0, 1, 0],
+            RequestKind::Close => {
+                c.closes += 1;
+                c.reply = vec![0x34, 0x12];
+            }
             RequestKind::ReadData => {
                 let offset = u32::from_be_bytes(envelope[2..6].try_into().unwrap());
                 let size = u32::from_be_bytes(envelope[6..10].try_into().unwrap());
@@ -316,6 +322,44 @@ fn capture(facts: &ServiceFacts, c: &Arc<Mutex<Camera>>, usb: UsbIds) -> Run {
             .await
     });
     Run { result, saved }
+}
+
+#[test]
+fn successful_capture_then_session_close_sends_one_close_and_no_other_command() {
+    let facts = located();
+    let c = camera(write_policy());
+    let (bulk, state) = (bulk(), state());
+    let inputs = Inputs {
+        facts: &facts,
+        bulk: &bulk,
+        state: &state,
+        flash: None,
+        reader: None,
+    };
+    let (result, end, commands_before_close) = block_on(async {
+        let mut session = peer_session(Device(c.clone()), 2 << 20, None)
+            .await
+            .unwrap();
+        let result = inputs
+            .capture(&mut session, USB, &mut |n, _| Ok(format!("{n}.bin")), &mut |_, _| {})
+            .await;
+        let before = c.lock().unwrap().commands.len();
+        (result, end_session(session).await, before)
+    });
+    result.expect("capture");
+    let camera = c.lock().unwrap();
+    assert_eq!(camera.closes, 1, "exactly one close");
+    assert!(end.closed);
+    assert_eq!(end.reply.as_deref(), Some("3412"));
+    assert!(end.error.is_none());
+    // The close is a control envelope only: no FF80 command follows it, and
+    // the gates written before it are still exactly the two allowed bytes.
+    assert_eq!(camera.commands.len(), commands_before_close);
+    assert!(camera.violations.is_empty(), "{:?}", camera.violations);
+    assert_eq!(
+        camera.configuration_writes,
+        [(GATE.offset, 1), (GUARD.offset, 1)]
+    );
 }
 
 #[test]

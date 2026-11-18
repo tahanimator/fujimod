@@ -51,11 +51,17 @@ open service session" (`crates/usb/src/ff80/session.rs` open reply `[0,0]`,
 packet 256). No command was sent and no write happened. Cause: `xe2-capture`
 calls `begin_session` but never closes the session, and `Session` drop sends no
 close, so the dry run's session stays open on the camera. Workaround: battery
-pull + re-entry before each run. Owner decision (2026-11-18): **keep the battery
-pull, no code fix.** A clean close (`Session::close`, C4) or
-`reclaim_session()` has never been sent to an X-E2. It may reach the stock
-teardown that restores defaults, and 0xa3 is unverified as the guard (unset
-during a dry run). Documented in `crates/xe2-capture/README.md`.
+pull + re-entry before each run. This was first kept as a
+battery-pull rule, because a C4 close had never been sent to an X-E2. Then the
+owner's Dev Tools export (2026-11-18 19:07Z, kept local) showed Dev Tools
+sending C4 to this X-E2 and opening a new session about 2 s later, twice. The
+owner confirms settings were intact afterwards. **Fixed:** after a *successful*
+`dry-run` or `capture`, `end_session` sends one C4 (never retried, never after a
+failure) and records the raw reply (`session_end` in the manifest). Test
+`successful_capture_then_session_close_sends_one_close_and_no_other_command`.
+The same export shows Dev Tools' own "Back up flash" fails on xe2-411 with
+`profile_custom: expected one checked implementation, found 0`, so Dev Tools
+cannot supply a reader either.
 
 **Capture, attempt 2** (after battery pull, no dry run first): exit 0, 182 FF80
 commands audited, all inside the policy. Manifest: `code_verified_before_any_write

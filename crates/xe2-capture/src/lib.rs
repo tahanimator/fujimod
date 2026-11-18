@@ -75,6 +75,36 @@ pub const X70_ASSUMED_DRY_RUN_NOTE: &str =
      correct for the X-E2. Only a real run reveals that. Treat the first real capture as the \
      actual test of these values, and be ready to pull the battery.";
 
+/// How a run ended its FF80 session.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionEnd {
+    /// The camera answered the close with two bytes.
+    pub closed: bool,
+    /// Those two bytes in hex, recorded as received and not interpreted.
+    pub reply: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Send the stock session close (C4) once, after a run that succeeded, so the
+/// next run can open a session without a battery pull. Observed on the
+/// owner's X-E2 from Dev Tools (2026-11-18): close, then a new session opened,
+/// settings intact. It is never retried and never sent after a failed run; a
+/// failed close is reported, not fatal, and the battery pull still recovers.
+pub async fn end_session(session: Session) -> SessionEnd {
+    match session.close().await {
+        Ok(reply) => SessionEnd {
+            closed: true,
+            reply: Some(hex(&reply)),
+            error: None,
+        },
+        Err(error) => SessionEnd {
+            closed: false,
+            reply: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]

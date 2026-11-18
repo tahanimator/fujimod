@@ -15,7 +15,7 @@ use fujimod_usb::{
     trace::Trace,
 };
 use fujimod_xe2_capture::{
-    BATTERY_REMINDER, Inputs, X70_ASSUMED_WARNING,
+    BATTERY_REMINDER, Inputs, SessionEnd, X70_ASSUMED_WARNING, end_session,
     facts::{AssumedX70Values, FIRMWARE_ID, ServiceFacts, UsbIds},
     flash::Reader,
     policy::{Auditor, Policy},
@@ -106,7 +106,9 @@ async fn run(args: &[String]) -> Result<(), Failure> {
             auditor.absorb(trace.drain());
             let commands = auditor.finish()?;
             let report = report?;
+            let end = end_session(session).await;
             println!("audited {commands} FF80 commands: all read-only");
+            print_session_end(&end);
             println!("{}", serde_json::to_string_pretty(&report)?);
             print_plan(&inputs);
             if let Some(note) = report.assumed_note {
@@ -118,6 +120,16 @@ async fn run(args: &[String]) -> Result<(), Failure> {
             capture(&inputs, Path::new(positional[1]), flash).await
         }
         _ => Err(usage.into()),
+    }
+}
+
+fn print_session_end(end: &SessionEnd) {
+    match (&end.reply, &end.error) {
+        (Some(reply), _) => println!("service session closed (camera replied {reply})"),
+        (None, Some(error)) => println!(
+            "service session NOT closed ({error}); pull the battery before the next run"
+        ),
+        (None, None) => println!("service session NOT closed; pull the battery before the next run"),
     }
 }
 
@@ -246,8 +258,11 @@ async fn capture(inputs: &Inputs<'_>, output: &Path, flash: bool) -> Result<(), 
         manifest.flash = Some(record);
         commands += flash_commands;
     }
+    let end = end_session(session).await;
+    print_session_end(&end);
     let mut json = serde_json::to_value(&manifest)?;
     json["audited_ff80_commands"] = commands.into();
+    json["session_end"] = serde_json::to_value(&end)?;
     fs::write(
         output.join("manifest.json"),
         serde_json::to_string_pretty(&json)?,
