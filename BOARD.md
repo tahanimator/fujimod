@@ -137,3 +137,6 @@ takes a local `.DAT` for stage grading. The same stages are stale in nearly ever
 - Gotchas: only 2 CPUs and 7 GB RAM, so run one heavy cargo build at a time (concurrent builds only
   contend). mise is not installed; mise tasks in `mise.toml` map directly to the commands shown. Run
   Python that touches the DAT with `uv run --locked python -I`; the DAT is read-only (`/home/claude/fw`).
+
+### Owner camera test (coordinator, 2026-11-18)
+Holding selector UP + full shutter while powering on **with USB connected** leaves the rear LED solid green and the X-E2 enumerates on Windows as `USB\VID_04CB&PID_FF80` (the FF80 service device) with no driver bound. Without USB the combo does nothing. So the family combo (x70/xe2s `service`, `usb: true`) appears to hold for the X-E2. U9's "no key sampling in main firmware" fits a boot-ROM/loader-level check. Pending: WinUSB binding so WebUSB/Dev Tools can open the device, then FF80 identification before adding `boot.service` to controls.json.
