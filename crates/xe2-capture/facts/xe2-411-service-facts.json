@@ -34,17 +34,17 @@
   "read_gate": {
     "value": null,
     "confidence": "unlocated",
-    "evidence": "Not located for xe2-411. This is the configuration-RAM byte that enables the FF80 debug memory reads (`debug_offset` in the service-workflow model). The repo's EXR II flash reader hard-codes 0xf7 for the X70 family (crates/workflows/src/flash/exr2.rs). That value is not confirmed on this firmware and is not taken from another body."
+    "evidence": "Still unlocated for xe2-411 (U11): no X-E2 code directly shows the debug-read gate offset/enabled value, so it must not be guessed or borrowed. U11 decoded the two A32 exec streams from FWUP0004.DAT (sha256 d324e147…; stream-0016025c base 0x8a0400, stream-0032025c base 0xf6a9c0, hashes match firmware.json) and located the FF80 vendor-command infrastructure in stream-0032025c: USB device descriptors 04cb:ff80 at 0x146bfc0/0x146bfd4; the (command,timeout) table at 0x146c004 (0x550001/0x760001/0x450006 = 1000 ms, 0x660002 = 60000 ms); the vendor-command handler-pointer table at 0x146c024 (29 real handlers at 0x10c9xxx-0x10cfxxx, default/unsupported handler 0x10cf7e0 returning status word 0x2005); the request parser at 0x10c89c0 that copies up to 4 command args into the RAM struct at 0x154335c; and the service-session state struct at 0x15434f0. The specific 200001/function-2 (read_memory) handler that consults the configuration-RAM gate byte, and the enabled constant it compares against, were NOT isolated to the 'X-E2 code directly shows the value' bar. The X70-family debug offset 0xf7 (crates/workflows/src/flash/exr2.rs: configuration_flags reads [0xa3,0xf7], require flags[1]==1) is NOT borrowed; a single `ldrb rX,[rY,#0xf7]` at 0x126d5f0 is unverified as the gate. Needs the external x70view service-workflow locator, or completion of the 200001-handler trace below."
   },
   "reset_guard": {
     "value": null,
     "confidence": "unlocated",
-    "evidence": "Not located for xe2-411. This is the configuration-RAM byte that stops the stock teardown from restoring defaults (`guard.offset`). The X70 family value 0xa3 (crates/workflows/src/flash/build.rs) is not confirmed on this firmware, and the guard's state words, callback table, aliases and output-state checks (service-workflow `guard`) are also not located."
+    "evidence": "Still unlocated for xe2-411 (U11): no X-E2 code directly shows the reset-guard offset or its value, so it must not be guessed or borrowed. This is the configuration-RAM byte that stops the stock service-mode teardown from restoring defaults (`guard.offset`, `guard.value` must be 1). U11 did not isolate the teardown routine that honors it; firmware does contain a `service_command` sender at 0x10F4BA8 (restart.generated.json; U9) whose in-session sub-command senders are at 0x10F4C28..0x10F5914, but the specific shutdown path that reads the guard byte was not pinned. The X70-family guard offset 0xa3 (crates/workflows/src/flash/build.rs) is NOT borrowed; `ldrb …,#0xa3` is a very common struct access in these streams (dozens of sites) and is not decisive. The guard's state words, callback table, aliases and output-state checks (service-workflow `guard`) are also not located."
   },
   "slow_read_bytes": {
     "value": null,
     "confidence": "unlocated",
-    "evidence": "Not located for xe2-411: the largest FF80 0x200001 read the firmware accepts per command (`configuration.memory_read_bytes`). It needs the same FF80 handler analysis as read_gate."
+    "evidence": "Still unlocated for xe2-411 (U11): the largest FF80 0x200001 read the firmware accepts per command (`configuration.memory_read_bytes`, tool bound 1..=4096). It is the size-limit comparison inside the same 200001/function-2 debug-read handler as read_gate, which U11 did not isolate from the handler table at 0x146c024 (see read_gate evidence). No size bound was derived from X-E2 code, so it is left null rather than assumed."
   },
   "flash_reader": {
     "value": null,

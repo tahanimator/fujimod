@@ -26,8 +26,75 @@ touches a physical camera.
 | U8 | X-E2 4.11 `service` and `first-start` fact tables (missing in catalog/generation.generated.json) | blocked | U8-worker | Sonnet 5.5 (no Opus/Fable subagent could be spawned: no agent tool in this session) | No generator for either table exists in this repo, so neither can be regenerated and generation.generated.json is unchanged. `first-start` = `catalog/firmware/<fw>/first-start.generated.json` (only x70-110, xt20-211 have one); failing locator for xe2-411 is `ui_frame_write_triplet_113d8` (also fails for xe2s, x100t, x30, xt10), which lives in the external x70view runner. `service` = `service-workflow.generated.json`, a runtime artifact staged by apps/web/scripts/stage-site.ts from an external runtime dir, never checked in for any firmware; xe2-411 fails on `profile_custom`. Needs the external runner (or owner-authored generator). Service combo: not confirmed from the X-E2 firmware; `boot.service` NOT added to xe2 controls.json (see final report). Firmware does contain a `service_command` routine (restart.generated.json, address 17779624) so service mode exists, but the button check was not located: main-fw scanner (event table 0xB84638, lookup 0x93EF68) has no external callers for UP/S1/S2 at boot, and the flash loader unit at 0 shows only one GPIO bit test. Other bodies with UP/nav+full-shutter: x70, xe2s, xt2, xt20, xh2s (family convention, not X-E2 evidence). |
 | U9 | Locate X-E2 service-mode power-on key combo in firmware | done | U9-worker | Opus | LOW confidence: no power-on button combo confirmed. Main firmware never samples UP(2) or S2(8) as held keys (is-key-held primitive 0x93F008 has 3 callers only: LENS_DET/PLAY/S1), so the x70/xe2s family combo (selector.up + full shutter) has no detection code in xe2-411 — consistent with the owner's failed USB test. `boot.service` NOT added to xe2 controls.json. See "U9 findings" below. |
 | U10 | Local read-only flash backup + state dumper for X-E2 4.11 (service mode) | review | U10-worker | Opus | Tool `crates/xe2-capture` (`fujimod-xe2-capture plan / dry-run / capture DIR`, Rust on nusb + WinUSB). Identity, dry run, policy and audit work now. State capture is refused until `read_gate`, `reset_guard` and `slow_read_bytes` are located (unlocated in `crates/xe2-capture/facts/xe2-411-service-facts.json`). Whole-flash backup is refused by policy: the only X-E2 NAND reader uploads and executes code. See "U10 findings". |
+| U11 | Locate xe2-411 service facts read_gate, reset_guard, slow_read_bytes | blocked | U11-worker | Opus | All three remain UNLOCATED: no X-E2 4.11 code directly shows the values and X70's 0xf7/0xa3 were not borrowed (guessing). Located the FF80 command infrastructure (dispatch table 0x146c024, descriptors 04cb:ff80, session struct 0x15434f0, parser 0x10c89c0) but did not isolate the 200001 read-handler gate/size or the teardown guard-byte to a high bar. Tool unchanged; gates intact; capture still correctly refused; tests 12/12 + workflows service_capture 11/11 pass. See "U11 findings". |
 
 ## Worker notes
+
+### U11 findings — xe2-411 read_gate / reset_guard / slow_read_bytes
+
+**Outcome: all three left UNLOCATED (confidence `unlocated`, value `null`). No
+X-E2 4.11 code directly shows any of the three values, so per the task I did not
+guess and did not borrow the X70-family constants (debug offset 0xf7, guard
+offset 0xa3 — hard-coded only for the EXR II flash reader in
+`crates/workflows/src/flash/{exr2.rs,build.rs}`). The capture tool is unchanged
+and still correctly refuses, naming each fact.**
+
+**How the facts are defined/used.** `crates/xe2-capture/src/facts.rs`:
+`read_gate`/`reset_guard` = `RamByte{offset, enabled_value}` in configuration
+RAM view 1 page 0; `slow_read_bytes` = u32 (tool bound 1..=4096). A fact is used
+only when `value` is present AND `confidence == high`; otherwise
+`service_capture`/the CLI refuse the dependent step and print the evidence.
+These map onto the external **service-workflow** model (`crates/catalog-workflows`
+`ServiceSetup`): `read_gate` = `debug_offset`, `reset_guard` =
+`guard.offset`/`guard.value` (value must be 1, offset != debug_offset, != 0x80,
+< cfg.size), `slow_read_bytes` = `configuration.memory_read_bytes` (<= 256 in
+that schema). That document is produced by the owner's private x70view locator
+(`profile_custom`) and is **not** checked in for ANY body, so X70 1.10 / X-E2S
+1.11 have no in-repo service-workflow either — the only in-repo trace of their
+values is the hard-coded 0xf7/0xa3 (gate value 1) in `flash/exr2.rs`
+(`configuration_flags` reads `[0xa3,0xf7]`; `require flags[1]==1`). I have only
+the X-E2 4.11 DAT here (no X70/X-E2S binaries), so cross-checks are structural.
+
+**X-E2 analysis done (genuine, verified).** Decoded both A32 exec streams from
+`/home/claude/fw/FWUP0004.DAT` with `fujimod.firmware.scan`/`decode` (raw DAT,
+not inverted): `stream-0016025c` base 0x8a0400 and `stream-0032025c` base
+0xf6a9c0, both sha256-matching firmware.json. Disassembled with llvm-mc/an ELF
+wrapper for llvm-objdump (ARM/A32, not Thumb — handler pointers are even). Located
+the FF80 vendor-command infrastructure in stream-0032025c:
+- USB device descriptors `04cb:ff80` at 0x146bfc0 / 0x146bfd4 (confirms U10/HIGH service_usb).
+- (command,timeout) table at 0x146c004: 0x550001/0x760001/0x450006 = 1000 ms, 0x660002 = 60000 ms.
+- Vendor-command handler-pointer table at 0x146c024: 29 real handlers in
+  0x10c9xxx-0x10cfxxx; default/unsupported handler 0x10cf7e0 returns status word 0x2005.
+- Request parser 0x10c89c0 copies up to 4 command args into RAM struct 0x154335c.
+- Service-session state struct at 0x15434f0 (fields used by the session/mode
+  handlers 0x10c99f0/0x10c9b18, result codes 0x2001/0x2003/0x2006/0x201d/0x201e).
+
+**Why still unlocated.** I did not isolate (to "X-E2 code directly shows it"):
+(a) the 200001/function-2 (read_memory) handler that consults the config-RAM
+gate byte and compares the enabled constant → read_gate; (b) the size-limit
+comparison in that same handler → slow_read_bytes; (c) the service-mode teardown
+path that reads the guard byte → reset_guard (U9/restart.generated.json put the
+`service_command` sender at 0x10F4BA8, sub-senders 0x10F4C28..0x10F5914, but the
+shutdown-time guard read was not pinned). Offset-byte search is not decisive:
+`ldrb …,#0xa3` occurs at dozens of sites (common struct offset); `ldrb …,#0xf7`
+occurs once (s32 0x126d5f0) but is unverified as the gate. The handler-table
+index→command-code mapping (two-level; not a direct group-byte index) was not
+resolved, so I could not name the 200001 handler with certainty.
+
+**Next steps (for the owner / whoever has x70view).** Either run the external
+`profile_custom` service-workflow locator for xe2-411, or finish the trace:
+resolve the 0x146c024 dispatcher's code→index map, disassemble the 200001 handler
+to read the gated config offset + enabled constant + per-read size bound, and the
+teardown for the guard offset/value; cross-check each routine's structure against
+X70 1.10 / X-E2S 1.11 (needs those binaries). Then set value + `confidence:high`
+with addresses/excerpts in `facts/xe2-411-service-facts.json` and update the
+`bundled_facts_refuse_capture…` test. No tool/policy change is otherwise needed.
+
+**Checks.** `cargo test -p fujimod-xe2-capture` 12/12; `cargo test -p
+fujimod-workflows --features fujimod-workflows/service-capture service_capture`
+11/11; JSON parses; `fujimod-xe2-capture plan` shows step 1 identify ready and
+steps 2-6 refused naming the facts. Firmware DAT not committed. Did not touch any
+camera/USB device or contact fujimod.com.
 
 ### U10 findings — local read-only X-E2 4.11 capture tool
 
