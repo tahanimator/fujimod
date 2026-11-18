@@ -59,6 +59,15 @@ owner confirms settings were intact afterwards. **Fixed:** after a *successful*
 `dry-run` or `capture`, `end_session` sends one C4 (never retried, never after a
 failure) and records the raw reply (`session_end` in the manifest). Test
 `successful_capture_then_session_close_sends_one_close_and_no_other_command`.
+**Verified on the camera (2026-11-18):** after one battery pull, three runs in a
+row with no pull between them. Dry run (8 commands, close reply `0d05`), then a
+capture into `-c` (182 commands, boot ROM `4ecedfbf…` again, close reply
+`0e05`), then a dry run (24 commands, close reply `0f05`). Every reopen
+succeeded. The replies count up by one per session, which fits the
+session-ID echo convention in `Session::close_checked`, but that is not
+confirmed. After the capture's close, 0xf7 and 0xa3 still read `1`: the close
+does not reset the RAM gates, so the last dry run could run the code checks.
+Those gates clear on a battery pull.
 The same export shows Dev Tools' own "Back up flash" fails on xe2-411 with
 `profile_custom: expected one checked implementation, found 0`, so Dev Tools
 cannot supply a reader either.
