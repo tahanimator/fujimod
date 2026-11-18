@@ -25,8 +25,84 @@ touches a physical camera.
 | U7 | Language font bank located and kept out of mod memory | todo | | | |
 | U8 | X-E2 4.11 `service` and `first-start` fact tables (missing in catalog/generation.generated.json) | blocked | U8-worker | Sonnet 5.5 (no Opus/Fable subagent could be spawned: no agent tool in this session) | No generator for either table exists in this repo, so neither can be regenerated and generation.generated.json is unchanged. `first-start` = `catalog/firmware/<fw>/first-start.generated.json` (only x70-110, xt20-211 have one); failing locator for xe2-411 is `ui_frame_write_triplet_113d8` (also fails for xe2s, x100t, x30, xt10), which lives in the external x70view runner. `service` = `service-workflow.generated.json`, a runtime artifact staged by apps/web/scripts/stage-site.ts from an external runtime dir, never checked in for any firmware; xe2-411 fails on `profile_custom`. Needs the external runner (or owner-authored generator). Service combo: not confirmed from the X-E2 firmware; `boot.service` NOT added to xe2 controls.json (see final report). Firmware does contain a `service_command` routine (restart.generated.json, address 17779624) so service mode exists, but the button check was not located: main-fw scanner (event table 0xB84638, lookup 0x93EF68) has no external callers for UP/S1/S2 at boot, and the flash loader unit at 0 shows only one GPIO bit test. Other bodies with UP/nav+full-shutter: x70, xe2s, xt2, xt20, xh2s (family convention, not X-E2 evidence). |
 | U9 | Locate X-E2 service-mode power-on key combo in firmware | done | U9-worker | Opus | LOW confidence: no power-on button combo confirmed. Main firmware never samples UP(2) or S2(8) as held keys (is-key-held primitive 0x93F008 has 3 callers only: LENS_DET/PLAY/S1), so the x70/xe2s family combo (selector.up + full shutter) has no detection code in xe2-411 — consistent with the owner's failed USB test. `boot.service` NOT added to xe2 controls.json. See "U9 findings" below. |
+| U10 | Local read-only flash backup + state dumper for X-E2 4.11 (service mode) | review | U10-worker | Opus | Tool `crates/xe2-capture` (`fujimod-xe2-capture plan / dry-run / capture DIR`, Rust on nusb + WinUSB). Identity, dry run, policy and audit work now. State capture is refused until `read_gate`, `reset_guard` and `slow_read_bytes` are located (unlocated in `crates/xe2-capture/facts/xe2-411-service-facts.json`). Whole-flash backup is refused by policy: the only X-E2 NAND reader uploads and executes code. See "U10 findings". |
 
 ## Worker notes
+
+### U10 findings — local read-only X-E2 4.11 capture tool
+
+**Tool:** `crates/xe2-capture`, binary `fujimod-xe2-capture`, a Rust CLI on the
+existing `fujimod-usb` FF80 session (nusb, which works with the WinUSB driver
+Zadig binds) and `fujimod-workflows::state::dump`. Commands: `plan` (offline),
+`dry-run` (no writes), `capture DIR`. Windows steps are in
+`crates/xe2-capture/README.md`, with a summary in the root README. I picked
+Rust over Python because the Python bindings also need a Rust build of the
+native extension, and the USB stack already uses nusb.
+
+**What `profile_custom` is:** not in this repo. It is a locator in the owner's
+private x70view tooling that feeds `service-workflow.generated.json`
+(`crates/catalog-workflows`). Dev Tools' "Back up flash" loads that document
+for the `ServiceSetup` facts: `ram_alias`, the configuration geometry,
+`debug_offset`, and `guard` (offset, aliases, code checks, state words,
+callback table, output state, payloads). It fails before sending a command
+because xe2-411 has no such document. A capture needs only a subset of it:
+the read gate (`debug_offset`), the reset guard, and the debug read size.
+`crates/workflows/src/service_capture.rs` lists the same subset.
+
+**Facts** (hand-authored, with evidence, in
+`crates/xe2-capture/facts/xe2-411-service-facts.json`):
+- HIGH: service USB `04cb:ff80`. Firmware USB device descriptors at 0x0146bfc0
+  and 0x0146bfd4 in stream-0032025c, plus the owner's enumeration.
+- HIGH: product `X-E2` and internal version `3.05`, from the catalog bulk and
+  execution facts.
+- HIGH: stock code checks. All 24 bulk/upload code checks and the mapped probe
+  re-hash to their catalog sha256 against the streams decoded from
+  FWUP0004.DAT.
+- Entry (UP + full shutter, USB connected): from the owner's hardware test,
+  not firmware.
+- UNLOCATED: `read_gate`, `reset_guard`, `slow_read_bytes`. The X70-family
+  values hard-coded in `crates/workflows/src/flash/` (guard 0xa3, debug 0xf7)
+  were not confirmed for xe2-411 and are not borrowed. I stopped the firmware
+  analysis for these facts before confirming them, so the capture step refuses
+  and names them. Whoever supplies them must add evidence and set
+  `confidence: high`; no code change is needed.
+
+**Flash backup refused by policy.** xe2-411 flash is 128 MiB raw NAND with no
+mapped window. Its only located reader, `exr2-query-heap`, allocates heap,
+uploads and executes a reader image, and swaps the stock diagnostic callback.
+Those writes and that code execution are outside the two-RAM-gate rule, so
+there is no read-only whole-flash path for this body.
+
+**Safety enforcement:**
+- `policy.rs` allowlists by FF80 bytes: device info, configuration geometry and
+  reads, memory function 2 reads, diagnostic query tag 0x80, E1 reads, and
+  session envelopes. Everything else is blocked, including memory function 3,
+  stored-view configuration writes, E0 uploads and other RAM bytes. RAM gate
+  writes are single bytes at page 0, at the located offsets only, with value
+  enabled or restore-to-0 (the guard is never cleared).
+- `lib.rs` has a single write call site, which checks its own bytes against the
+  policy before sending. The CLI audits the USB trace incrementally, and the
+  mock camera in the tests applies the policy to every command.
+- The tool refuses non-query bulk sources, which would need memory writes.
+- Order:
+  1. identity (USB IDs, product, version);
+  2. read and record the gate and guard originals;
+  3. stock code checks with the gate as found;
+  4. only if the camera refuses those reads, enable the read gate, re-check,
+     and restore it on a mismatch;
+  5. arm the guard;
+  6. `state::dump` (the boot ROM is read twice).
+  Every run reminds the owner to pull the battery, never use OFF.
+
+**Tests:** `cargo test -p fujimod-xe2-capture` passes 12/12. They cover a mock
+FF80 camera on the real session code: identity mismatches,
+missing-facts refusal, code mismatch with the gate open and closed, the dry run
+never writing, a full capture writing exactly the two gates, the policy
+opcode table, and a source scan. `cargo test -p fujimod-usb -p
+fujimod-workflows --features fujimod-workflows/service-capture` passes. The
+`fujimod-crate-graph` layer test has two failures that are not from this unit
+(`fujimod-emulator-board-graph` is unlisted; `fujimod-emulator-boot` depends
+on model crates). No Python code changed.
 
 ### U9 findings — X-E2 service-mode power-on combo
 
