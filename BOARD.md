@@ -28,8 +28,81 @@ touches a physical camera.
 | U10 | Local read-only flash backup + state dumper for X-E2 4.11 (service mode) | review | U10-worker | Opus | Tool `crates/xe2-capture` (`fujimod-xe2-capture plan / dry-run / capture DIR`, Rust on nusb + WinUSB). Identity, dry run, policy and audit work now. State capture is refused until `read_gate`, `reset_guard` and `slow_read_bytes` are located (unlocated in `crates/xe2-capture/facts/xe2-411-service-facts.json`). Whole-flash backup is refused by policy: the only X-E2 NAND reader uploads and executes code. See "U10 findings". |
 | U11 | Locate xe2-411 service facts read_gate, reset_guard, slow_read_bytes | blocked | U11-worker | Opus | All three remain UNLOCATED: no X-E2 4.11 code directly shows the values and X70's 0xf7/0xa3 were not borrowed (guessing). Located the FF80 command infrastructure (dispatch table 0x146c024, descriptors 04cb:ff80, session struct 0x15434f0, parser 0x10c89c0) but did not isolate the 200001 read-handler gate/size or the teardown guard-byte to a high bar. Tool unchanged; gates intact; capture still correctly refused; tests 12/12 + workflows service_capture 11/11 pass. See "U11 findings". |
 | U13 | Flash backup via temporary RAM code in xe2-capture (owner-approved) | review | U13-worker | Opus | `fujimod-xe2-capture capture DIR --flash` (commit 95caadf) reuses `fujimod_workflows::flash::backup` (EXR II `exr2-query-heap`) unchanged: upload to a stock heap block in RAM, run, read NAND via the stock page reader, clean up; read twice, hashed, cleanup read back and reported. Still REFUSED before any USB command: read_gate/reset_guard/slow_read_bytes unlocated, AND no reviewed X-E2 reader image exists in the repo to pin (the reader source and staged flash-reader artifacts are external). Tests 20/20; workflows 87/87. See "U13 findings". |
+| U14 | Emulator trace of xe2-411 service facts (read_gate, reset_guard, slow_read_bytes) | blocked | U14-worker | Opus | Could NOT bring up X-E2 4.11 in the repo's emulator on this machine, so no FF80 handler behavior was observed; all three facts stay null/unlocated (not guessed, X70's 0xf7/0xa3 not borrowed). Blockers: (A) native boot refuses xe2-411 — run.json has null inputs/scene/execution ("configuration xe2-411 declares no startup inputs", reproduced) and open_exr2 requires the 16 KiB boot ROM sha256 4ecedfbf… which is absent everywhere; (B) web/wasm simulated camera needs a prebuilt USB wasm bundle + emulate.usb catalog facts + xe2 boot.service controls + wasm/nightly toolchain, all absent/unavailable; (C) no in-repo fixture runs the firmware answering FF80 (usb-app80 tests use a scripted transport, not an emulated board). Unicorn CPU + emulator crates build/run here — the blocker is firmware bring-up, not execution. Facts evidence updated with the emulator attempt; gates intact; capture still correctly refused. Tests 20/20, service_capture 11/11, plan refuses steps 2-6 naming the facts. See "U14 findings". |
 
 ## Worker notes
+
+### U14 findings — emulator trace of xe2-411 service facts
+
+**Outcome: the dynamic emulator trace could not be run. The X-E2 4.11 firmware
+cannot be brought up in this repo's emulator on this machine, so read_gate,
+reset_guard and slow_read_bytes remain `null` / `unlocated`. Per the task
+("if the X-E2 can't be started that way, document exactly why and stop; don't
+build large new emulator features") I stopped and documented. No value was
+guessed; the X70-family 0xf7/0xa3 were not borrowed. The tool, its policy and
+its safety gates are unchanged and still correctly refuse the capture.**
+
+I mapped every path the repo has for running an X-E2 and each is blocked here:
+
+- **(A) Native Rust boot** (`crates/emulator-boot` `open_exr2` / the
+  `fujimod-emulator boot` CLI). Refused at `prepared()` because
+  `configurations/emulator/xe2-411/run.json` declares `inputs`, `scene` and
+  `execution` all `null` — the native path requires all three (only the
+  `*-rec` configs like `x70-110-rec` carry them). Reproduced empirically:
+  `fujimod-emulator boot --configuration xe2-411 --update …FWUP0004.DAT` →
+  `configuration xe2-411 declares no startup inputs` (same with the
+  `xe2-411-browser-usb` overlay). Independently, `open_exr2` verifies a 16 KiB
+  boot-ROM file by sha256 `4ecedfbfc1910bde488d36abe4380621f8845e6afcfc6cf54a49a33ec0abf9be`
+  (CLI: "The ROM dump is required"); that ROM exists nowhere on this machine
+  (U0 reported the same for the SD-boot stages — it is the shared X70/EXR-II
+  boot ROM and is not inside the DAT). The real-boot tests in
+  `emulator-boot/src/tests.rs` themselves skip unless `FUJIMOD_TEST_BOOT_ROM`
+  and `FUJIMOD_TEST_UPDATE` are set.
+- **(B) Web/wasm simulated camera** (`apps/web/src/dev-tools/simulated-camera.ts`,
+  `WasmEngine` + `Exr2UsbBus`). Needs a prebuilt per-firmware USB wasm bundle
+  (`firmware.emulate.usb.bundle` + `wasm.json` manifest with a `usb.kind=exr2`
+  node); none is on the machine and `catalog/generation.generated.json` has no
+  `emulate` facts for any body. It also reads
+  `selection.physical_controls.boot.service` for the boot chord, which xe2 does
+  not have (U9 deliberately did not add `boot.service` to xe2 controls.json), so
+  it throws "no service-mode boot inputs". Building the bundle needs the wasm
+  target + pinned nightly, both unavailable (U0: `static.rust-lang.org` blocked).
+- **(C) In-process FF80 fixture.** There is no in-repo fixture that runs the
+  real firmware and answers FF80: the `usb-app80` / `usb` FF80 tests drive a
+  scripted transport (`crates/usb/src/testing.rs` `Script`), i.e. a mock, not an
+  emulated board. Invoking the 0x200001 read handler directly on a bare
+  `exr2` board (load firmware sections into DRAM, set PC, run under a Unicorn
+  mem-read hook) is possible mechanically, but the handler consults a
+  configuration-RAM byte and a service-session struct (0x15434f0) that only the
+  full boot + USB enumeration + service entry populate; against uninitialised
+  state it cannot *demonstrate the gate/bound changing the handler's behaviour*
+  (the task's step-4 bar for `high`), and reconstructing that state is exactly
+  the "large new emulator feature" the task forbids.
+
+The execution engine itself is fine here: Unicorn (`libunicorn.a`) and the
+emulator crates are already built and the board run/trace API
+(`board.run_for_instructions`, `read_physical`/`write_physical`,
+`read_register`/`write_register`, `board.trace_pcs`, Unicorn mem hooks) works.
+The blocker is firmware *bring-up inputs* (boot ROM + declared run inputs /
+service-mode controls / a prebuilt USB bundle), not the CPU.
+
+**What would unblock this (for the owner / whoever has the missing inputs):**
+either (1) supply the 16 KiB X70/EXR-II boot ROM dump AND author
+`configurations/emulator/xe2-411` native run inputs+scene+execution (or a
+`service-session` hardware-inputs profile like the existing
+`xe2s-service-session` one, which xe2 lacks), then boot and single-step the
+0x200001 handler under a mem-read hook to read the gated config offset + enabled
+constant + per-read size bound, and the teardown guard offset/value; or (2) run
+the external x70view `profile_custom` service-workflow locator for xe2-411; or
+(3) build the per-firmware USB wasm bundle and drive it via `simulated-camera`.
+Then set each value with `confidence: high` and the before/after reply, and
+update the refuse test. No tool or policy change is otherwise needed.
+
+**Checks.** `cargo test -p fujimod-xe2-capture` 20/20; `cargo test -p
+fujimod-workflows --features fujimod-workflows/service-capture service_capture`
+11/11; `fujimod-xe2-capture plan` shows step 1 identify `[ready]` and steps 2-6
+`[REFUSED]` naming the three facts. JSON valid. Did not touch any physical
+camera or USB device and did not contact fujimod.com. Firmware DAT not committed.
 
 ### U13 findings — flash backup via temporary RAM code (owner-approved)
 
