@@ -5,6 +5,12 @@
 //! with it after each run. Anything not listed is a violation, including every
 //! memory write, every storage-view configuration write, data uploads and
 //! console, event, restart and firmware-update commands.
+//!
+//! [`FlashPolicy`] is the separate, narrower allowance for the owner-approved
+//! flash backup phase: RAM writes inside DRAM that never touch pinned stock
+//! code, and diagnostic queries that run the uploaded reader. It permits no
+//! configuration write, no stored write, no data upload (E0) and no firmware,
+//! restart or console command, so no flash erase/program request can be sent.
 use crate::facts::RamByte;
 
 pub const DEVICE_INFO: u32 = 0x150000;
@@ -40,7 +46,29 @@ pub struct Violation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Read,
-    RamGateWrite { offset: u32, value: u8 },
+    RamGateWrite {
+        offset: u32,
+        value: u8,
+    },
+    /// Flash phase only: a DRAM write outside every pinned code range.
+    RamWrite {
+        address: u32,
+        length: u32,
+    },
+    /// Flash phase only: a diagnostic query that runs the published callback.
+    Execute {
+        argument: u32,
+    },
+}
+
+/// A classifier of FF80 command bytes, applied on the wire and in the audit.
+pub trait CommandCheck: Send {
+    fn check(&self, request: &[u8]) -> Result<Kind, Violation>;
+}
+impl CommandCheck for Policy {
+    fn check(&self, request: &[u8]) -> Result<Kind, Violation> {
+        Policy::check(self, request)
+    }
 }
 
 fn word(bytes: &[u8], at: usize) -> Option<u32> {
@@ -107,6 +135,77 @@ impl Policy {
     }
 }
 
+/// The flash-backup phase allowance. Reads are as in [`Policy::read_only`];
+/// configuration writes of any kind are refused (the gates must already be
+/// set by the state capture); memory writes must lie wholly in DRAM and miss
+/// every protected range; diagnostic queries may carry any argument because
+/// the stock dispatcher passes it to the callback the reader path published.
+#[derive(Clone, Debug)]
+pub struct FlashPolicy {
+    /// Physical DRAM `[start, end)`.
+    pub dram: (u64, u64),
+    /// The uncached alias bit added to physical DRAM addresses.
+    pub alias: u64,
+    /// Physical `[start, end)` ranges never written: all pinned stock code.
+    pub protected: Vec<(u64, u64)>,
+    /// Largest memory write per command.
+    pub max_write: u32,
+}
+impl FlashPolicy {
+    fn physical(&self, address: u64) -> Option<u64> {
+        let (start, end) = self.dram;
+        let address = if address >= self.alias && address - self.alias < end {
+            address - self.alias
+        } else {
+            address
+        };
+        (address >= start && address < end).then_some(address)
+    }
+    pub fn check(&self, request: &[u8]) -> Result<Kind, Violation> {
+        let command = word(request, 0).unwrap_or(0);
+        let deny = |reason| Err(Violation { command, reason });
+        let Some(function) = word(request, 16) else {
+            return deny("short command");
+        };
+        match command {
+            MEMORY if function == WRITE => {
+                let (Some(address), Some(length)) = (word(request, 28), word(request, 32)) else {
+                    return deny("short memory write");
+                };
+                if length == 0 || length > self.max_write || request.len() != 36 + length as usize {
+                    return deny("memory write length differs from its data");
+                }
+                let first = self.physical(u64::from(address));
+                let last = self.physical(u64::from(address) + u64::from(length) - 1);
+                let (Some(first), Some(last)) = (first, last) else {
+                    return deny("memory writes outside DRAM are never sent");
+                };
+                if last < first || last - first + 1 != u64::from(length) {
+                    return deny("memory write crosses the DRAM alias");
+                }
+                if self
+                    .protected
+                    .iter()
+                    .any(|&(start, end)| first < end && start <= last)
+                {
+                    return deny("memory write overlaps pinned stock code");
+                }
+                Ok(Kind::RamWrite { address, length })
+            }
+            DIAGNOSTIC_QUERY if request.len() == 32 => Ok(Kind::Execute { argument: function }),
+            CONFIGURATION if function == WRITE => {
+                deny("no configuration write is sent during the flash backup")
+            }
+            _ => Policy::read_only().check(request),
+        }
+    }
+}
+impl CommandCheck for FlashPolicy {
+    fn check(&self, request: &[u8]) -> Result<Kind, Violation> {
+        FlashPolicy::check(self, request)
+    }
+}
+
 /// Data-phase control requests: E1 reads are allowed, E0 data uploads are not.
 pub fn check_control(kind: fujimod_usb::ff80::framing::RequestKind) -> Result<(), Violation> {
     use fujimod_usb::ff80::framing::RequestKind as K;
@@ -141,14 +240,14 @@ pub fn check_lifecycle(envelope: &[u8]) -> Result<(), Violation> {
 /// Incremental audit of a USB trace against a policy. Drain it often during
 /// long transfers so the bounded trace never drops events.
 pub struct Auditor {
-    pub policy: Policy,
+    pub policy: Box<dyn CommandCheck>,
     pub commands: usize,
     pub first_violation: Option<String>,
 }
 impl Auditor {
-    pub fn new(policy: Policy) -> Self {
+    pub fn new(policy: impl CommandCheck + 'static) -> Self {
         Self {
-            policy,
+            policy: Box::new(policy),
             commands: 0,
             first_violation: None,
         }
@@ -190,6 +289,10 @@ impl Auditor {
                 Err(v) => violation(v.to_string()),
             }
         }
+    }
+    /// Switch to another phase's allowance after draining the trace.
+    pub fn switch(&mut self, policy: impl CommandCheck + 'static) {
+        self.policy = Box::new(policy);
     }
     pub fn finish(self) -> Result<usize, String> {
         match self.first_violation {

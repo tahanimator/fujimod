@@ -96,20 +96,23 @@ adapters handle execution and language boundaries.
 
 ## X-E2 4.11 local service-mode capture (Windows)
 
-[`crates/xe2-capture`](crates/xe2-capture/README.md) is a read-only command-line
+[`crates/xe2-capture`](crates/xe2-capture/README.md) is a local command-line
 tool. It identifies an X-E2 4.11 in service mode and dumps its camera state to
-a local folder. Windows steps:
+a local folder; with `--flash` it also backs up the internal flash using a
+pinned reader that runs in camera RAM and is cleaned up. Windows steps:
 
 1. Build it with `cargo build --release -p fujimod-xe2-capture`.
 2. Enter service mode with USB connected: hold selector UP and the full
    shutter while switching ON. The LED turns solid green.
 3. Bind WinUSB to `04CB FF80` with Zadig.
 4. Always run `fujimod-xe2-capture dry-run` first.
-5. Then run `fujimod-xe2-capture capture NEW_FOLDER`.
+5. Then run `fujimod-xe2-capture capture NEW_FOLDER` (add `--flash` for the
+   flash backup).
 6. Leave service mode by pulling the battery, never with the OFF switch.
 
-The whole-flash backup is refused, and the capture stays refused until its
-missing facts are located; the crate README explains why.
+The capture stays refused until its missing facts are located, and the flash
+backup also needs a reviewed reader image pinned in the facts file; the crate
+README explains both.
 
 ## Continuous integration
 

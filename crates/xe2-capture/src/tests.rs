@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     facts::{Confidence, Fact},
-    policy::{Auditor, Kind, Policy, check_control},
+    policy::{Auditor, CommandCheck, Kind, Policy, check_control},
 };
 use fujimod_usb::{
     ff80::framing::RequestKind,
@@ -49,12 +49,16 @@ struct Camera {
     /// Refuse debug memory reads while the test read gate is 0.
     gated: bool,
     reply: Vec<u8>,
-    policy: Policy,
+    policy: Option<Box<dyn CommandCheck>>,
     violations: Vec<String>,
+    /// EXR II reader emulation; `None` keeps the stock-only camera.
+    exr2: Option<Exr2>,
     configuration_writes: Vec<(u32, u8)>,
     commands: Vec<u32>,
     base: u32,
     source_state: u32,
+    callback_offset: u32,
+    stock_callback: u32,
 }
 impl Camera {
     fn byte(&self, address: u32) -> u8 {
@@ -111,7 +115,8 @@ impl Peer for Device {
         let mut c = self.0.lock().unwrap();
         let command = word(raw, 0);
         c.commands.push(command);
-        match c.policy.check(raw) {
+        let checked = c.policy.as_ref().expect("camera policy").check(raw);
+        match checked {
             Err(v) => {
                 c.violations.push(v.to_string());
                 c.reply = raw[..raw.len().min(36)].to_vec();
@@ -121,6 +126,21 @@ impl Peer for Device {
                 c.configuration_writes.push((offset, value));
             }
             Ok(Kind::Read) => {}
+            Ok(Kind::RamWrite { address, length }) => {
+                for n in 0..length {
+                    let b = raw[36 + n as usize];
+                    c.overrides.insert(physical(address + n), b);
+                }
+                c.reply = raw[..36].to_vec();
+                return Ok(());
+            }
+            Ok(Kind::Execute { argument }) => {
+                let callback = c.word_at(c.callback_slot());
+                if callback != c.stock_callback {
+                    c.reply = c.execute(callback, argument);
+                    return Ok(());
+                }
+            }
         }
         let function = word(raw, 16);
         c.reply = match (command, function) {
@@ -244,8 +264,10 @@ fn camera(policy: Policy) -> Arc<Mutex<Camera>> {
         product: "X-E2".into(),
         version: "3.05".into(),
         configuration: vec![0; 0x1000],
-        policy,
+        policy: Some(Box::new(policy)),
         base: base as u32,
+        callback_offset: callback_offset as u32,
+        stock_callback: stock_callback as u32,
         source_state: (source_state as u32) & !ALIAS,
         ..Camera::default()
     };
@@ -274,6 +296,7 @@ fn capture(facts: &ServiceFacts, c: &Arc<Mutex<Camera>>, usb: UsbIds) -> Run {
         bulk: &bulk,
         state: &state,
         flash: None,
+        reader: None,
     };
     let mut saved = Vec::new();
     let result = block_on(async {
@@ -313,11 +336,25 @@ fn bundled_facts_refuse_capture_and_flash_naming_the_missing_facts() {
         bulk: &bulk,
         state: &state,
         flash: None,
+        reader: None,
     }
     .plan();
-    let flash = plan.iter().find(|s| s.name == "back up flash").unwrap();
+    let flash = plan
+        .iter()
+        .find(|s| s.name.starts_with("back up flash"))
+        .unwrap();
     assert!(!flash.ready);
-    assert_eq!(flash.refused_because[0].fact, "flash_reader");
+    let names: Vec<_> = flash.refused_because.iter().map(|m| m.fact).collect();
+    assert_eq!(
+        names,
+        [
+            "read_gate",
+            "reset_guard",
+            "slow_read_bytes",
+            "flash_reader",
+            "flash_reader"
+        ]
+    );
     assert!(plan.iter().find(|s| s.name == "identify").unwrap().ready);
 }
 
@@ -438,6 +475,7 @@ fn dry_run_sends_no_write() {
             bulk: &bulk,
             state: &state,
             flash: None,
+            reader: None,
         };
         let trace = fujimod_usb::trace::Trace::new(
             std::num::NonZeroU32::new(4096).unwrap(),
@@ -470,6 +508,7 @@ fn dry_run_checks_code_when_reads_are_allowed() {
         bulk: &bulk,
         state: &state,
         flash: None,
+        reader: None,
     };
     let report = block_on(async {
         let mut session = peer_session(Device(c.clone()), 2 << 20, None)
@@ -545,7 +584,7 @@ fn crate_source_has_one_write_call_site() {
         "send_event",
         "submit_console",
         "research_command",
-        "flash::",
+        "fujimod_workflows::flash",
         "debug_mode::",
         "restart::",
         "install::",
@@ -578,4 +617,672 @@ fn facts_reject_unsafe_shapes() {
         facts.read_gate.usable("read_gate").is_err(),
         "unlocated confidence"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Flash backup through the reused EXR II reader path (U13).
+// ---------------------------------------------------------------------------
+use crate::{
+    facts::FlashReader,
+    flash::{EXR2_READ_GATE, EXR2_RESET_GUARD, FlashRecord, Reader},
+    reader_scan,
+};
+use fujimod_workflows::flash::{
+    Artifact, CodeCheck, Payload,
+    exr2::{self, Configuration},
+};
+
+/// The camera side of the EXR II reader ABI: the stock allocator and release
+/// reached through the bootstrap stub, the cache primitives, and the uploaded
+/// reader filling its request from emulated NAND. There is no NAND write path.
+#[derive(Default)]
+struct Exr2 {
+    nand: Vec<u8>,
+    bootstrap: u32,
+    allocate: u32,
+    release: u32,
+    cache: Vec<u32>,
+    stock_reader: u32,
+    /// The reader body the test pinned; a block holding anything else never runs.
+    body: Vec<u8>,
+    heap: u32,
+    allocations: Vec<u32>,
+    released: Vec<u32>,
+    reader_runs: usize,
+    stock_entries: Vec<u32>,
+    executed: Vec<u32>,
+    refuse_release: bool,
+}
+
+impl Camera {
+    fn word_at(&self, address: u32) -> u32 {
+        word(&self.bytes(address, 4), 0)
+    }
+    fn callback_slot(&self) -> u32 {
+        physical(TABLE_POINTER) + self.callback_offset
+    }
+    fn put_bytes(&mut self, address: u32, bytes: &[u8]) {
+        for (n, &b) in bytes.iter().enumerate() {
+            self.overrides.insert(physical(address) + n as u32, b);
+        }
+    }
+    /// One diagnostic query while a non-stock callback is published.
+    fn execute(&mut self, callback: u32, argument: u32) -> Vec<u8> {
+        let mut e = self
+            .exr2
+            .take()
+            .expect("EXR II emulation for a published callback");
+        e.executed.push(callback);
+        let outputs = self.source_state;
+        let ok = if e.cache.contains(&callback) {
+            true
+        } else if callback == e.bootstrap {
+            let function = self.word_at(outputs + 4);
+            if function == e.allocate {
+                let block = e.heap + e.allocations.len() as u32 * 0x10_0000;
+                e.allocations.push(block);
+                self.put_word(outputs, block);
+                true
+            } else if function == e.release {
+                if !e.refuse_release {
+                    e.released.push(argument);
+                }
+                !e.refuse_release
+            } else {
+                self.violations
+                    .push(format!("bootstrap called unpinned {function:#x}"));
+                false
+            }
+        } else if e.allocations.last() == Some(&callback) && !e.released.contains(&callback) {
+            if self.bytes(callback, e.body.len() as u32) != e.body {
+                self.violations
+                    .push("block holds an unpinned reader".into());
+                false
+            } else {
+                e.reader_runs += 1;
+                let request = physical(argument);
+                let w = |c: &Camera, i: u32| c.word_at(request + 4 * i);
+                let (offset, size, buffer, stock) =
+                    (w(self, 1), w(self, 2), w(self, 3), w(self, 4));
+                e.stock_entries.push(stock);
+                let data = e.nand[offset as usize..(offset + size) as usize].to_vec();
+                self.put_bytes(buffer, &data);
+                let calls = w(self, 11) + 1;
+                for (at, value) in [(40, 0), (44, calls), (48, offset), (52, size), (56, size)] {
+                    self.put_word(request + at, value);
+                }
+                let pages = size / 2048;
+                let bitmap = pages.div_ceil(32) * 4;
+                self.put_bytes(request + 76, &vec![0; 16 + bitmap as usize]);
+                true
+            }
+        } else {
+            self.violations
+                .push(format!("query ran unpinned entry {callback:#x}"));
+            false
+        };
+        self.exr2 = Some(e);
+        let mut reply = vec![0; 32];
+        reply[..4].copy_from_slice(&policy::DIAGNOSTIC_QUERY.to_le_bytes());
+        if !ok {
+            reply[4] = 1;
+        }
+        reply
+    }
+}
+
+const FLASH_BYTES: u64 = 0x8_0000;
+const PRIMITIVES: u64 = 0x0100_0000;
+const CONFIGURATION: u32 = 0x0150_0000;
+const HEAP: u32 = 0x0800_0000;
+const NOP: u32 = 0xe1a0_0000;
+const BRANCH_SELF: u32 = 0xeaff_fffe;
+
+fn nand(offset: u64) -> u8 {
+    ((offset >> 11) as u8).wrapping_mul(31) ^ (offset as u8) ^ 0xa5
+}
+fn nand_bytes() -> Vec<u8> {
+    (0..FLASH_BYTES).map(nand).collect()
+}
+/// The real xe2-411 flash contract, shrunk to a small device whose control
+/// bytes are the mock's NAND.
+fn test_flash() -> FirmwareFlash {
+    let mut doc: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../catalog/firmware/xe2/4.11/flash.generated.json"
+    ))
+    .unwrap();
+    let data = nand_bytes();
+    doc["window"]["size"] = FLASH_BYTES.into();
+    doc["control"]["sha256"] = hex(&checks::sha256_bytes(&data[0x4_0000..0x4_8000])).into();
+    serde_json::from_value(doc).unwrap()
+}
+fn stock_sha(address: u64, size: u64) -> String {
+    let bytes: Vec<u8> = (0..size as u32)
+        .map(|i| pattern((address as u32 | ALIAS) + i))
+        .collect();
+    hex(&checks::sha256_bytes(&bytes))
+}
+fn words_le(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+/// Bootstrap `bx lr` padded to the slot, then `body`, then the observer.
+fn image_with(body: &[u32]) -> Vec<u8> {
+    let mut image = words_le(&[reader_scan::BX_LR]);
+    image.resize(32, 0);
+    image.extend(words_le(body));
+    image.extend(words_le(&[reader_scan::BX_LR]));
+    image
+}
+fn good_image() -> Vec<u8> {
+    image_with(&[NOP, NOP, BRANCH_SELF])
+}
+/// Artifact, image and pin for `image`, built the way build::prepare_exr2 lays
+/// out a payload (test fixture only; no camera code is authored here).
+fn reader_parts(image: &[u8], flash: &FirmwareFlash) -> (FlashReader, Vec<u8>) {
+    let p = PRIMITIVES as u32;
+    let mut checks: Vec<CodeCheck> = flash
+        .code_ranges
+        .iter()
+        .map(|r| CodeCheck {
+            address: r.address,
+            size: r.size,
+            sha256: stock_sha(r.address, r.size),
+        })
+        .collect();
+    checks.push(CodeCheck {
+        address: PRIMITIVES,
+        size: 0x40,
+        sha256: stock_sha(PRIMITIVES, 0x40),
+    });
+    let payload = exr2::Payload {
+        schema: 6,
+        firmware_id: "xe2-411".into(),
+        firmware_sha256: ServiceFacts::bundled().firmware_sha256,
+        sha256: hex(&checks::sha256_bytes(image)),
+        bootstrap_size: 4,
+        reader_offset: 32,
+        observer_offset: image.len() as u32 - 4,
+        allocate: p,
+        release: p + 4,
+        configuration: Configuration::Fixed {
+            address: CONFIGURATION,
+        },
+        cache_clean: p + 8,
+        instruction_invalidate: p + 12,
+        barrier: p + 16,
+        instruction_barrier: p + 20,
+        checks,
+        control_sha256: flash.control.sha256.clone(),
+        update_size: FLASH_BYTES,
+    };
+    let artifact = serde_json::to_vec(&Artifact {
+        payload: Payload::Exr2Query(payload),
+        image: Some("reader.bin".into()),
+    })
+    .unwrap();
+    let pin = FlashReader {
+        mechanism: "exr2-query-heap".into(),
+        artifact: "reader.json".into(),
+        artifact_sha256: hex(&checks::sha256_bytes(&artifact)),
+        image: "reader.bin".into(),
+        image_sha256: hex(&checks::sha256_bytes(image)),
+        image_bytes: image.len() as u32,
+        review: "test fixture".into(),
+    };
+    (pin, artifact)
+}
+/// Located facts that agree with the reused reader's RAM-gate offsets, and a
+/// pinned reader.
+fn flash_facts(pin: &FlashReader) -> ServiceFacts {
+    let mut f = located();
+    f.read_gate = high(RamByte {
+        offset: EXR2_READ_GATE,
+        enabled_value: 1,
+    });
+    f.reset_guard = high(RamByte {
+        offset: EXR2_RESET_GUARD,
+        enabled_value: 1,
+    });
+    f.flash_reader = high(pin.clone());
+    f
+}
+fn verified(facts: &ServiceFacts, flash: &FirmwareFlash, image: &[u8]) -> Result<Reader> {
+    let (pin, artifact) = reader_parts(image, flash);
+    Reader::verify(&pin, &artifact, image, facts, flash, &bulk())
+}
+fn flash_camera(facts: &ServiceFacts, flash: &FirmwareFlash) -> Arc<Mutex<Camera>> {
+    let c = camera(Policy {
+        read_gate: facts.read_gate.value,
+        reset_guard: facts.reset_guard.value,
+    });
+    {
+        let mut camera = c.lock().unwrap();
+        for check in &flash.state_checks {
+            camera.put_word(check.address as u32, check.value as u32);
+        }
+        let p = PRIMITIVES as u32;
+        camera.exr2 = Some(Exr2 {
+            nand: nand_bytes(),
+            bootstrap: CONFIGURATION + 0x80,
+            allocate: p,
+            release: p + 4,
+            cache: vec![p + 8, p + 12, p + 16, p + 20],
+            stock_reader: flash
+                .code_ranges
+                .iter()
+                .find(|r| r.name == "nand_read_transfer")
+                .unwrap()
+                .address as u32,
+            body: good_image()[32..].to_vec(),
+            heap: HEAP,
+            ..Exr2::default()
+        });
+    }
+    c
+}
+
+struct FlashRun {
+    capture: Option<Result<Manifest>>,
+    flash: Result<FlashRecord>,
+    sunk: Vec<(u64, Vec<u8>)>,
+}
+/// State capture (sets the RAM gates), then the flash phase under its policy.
+fn flash_run(
+    facts: &ServiceFacts,
+    c: &Arc<Mutex<Camera>>,
+    flash: &FirmwareFlash,
+    reader: Option<&Reader>,
+    with_capture: bool,
+) -> FlashRun {
+    let (bulk, state) = (bulk(), state());
+    let inputs = Inputs {
+        facts,
+        bulk: &bulk,
+        state: &state,
+        flash: Some(flash),
+        reader,
+    };
+    let mut sunk = Vec::new();
+    let (capture, flash) = block_on(async {
+        let mut session = peer_session(Device(c.clone()), 2 << 20, None)
+            .await
+            .unwrap();
+        let capture = if with_capture {
+            Some(
+                inputs
+                    .capture(
+                        &mut session,
+                        USB,
+                        &mut |n, _| Ok(format!("{n}.bin")),
+                        &mut |_, _| {},
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
+        c.lock().unwrap().policy = Some(Box::new(inputs.flash_policy()));
+        let flash = inputs
+            .back_up_flash(
+                &mut session,
+                USB,
+                &mut |offset, bytes| {
+                    sunk.push((offset, bytes.to_vec()));
+                    Ok(())
+                },
+                &mut |_, _| {},
+            )
+            .await;
+        (capture, flash)
+    });
+    FlashRun {
+        capture,
+        flash,
+        sunk,
+    }
+}
+
+#[test]
+fn flash_backup_uploads_runs_reads_twice_and_cleans_up() {
+    let flash = test_flash();
+    let image = good_image();
+    let (pin, _) = reader_parts(&image, &flash);
+    let facts = flash_facts(&pin);
+    let reader = verified(&facts, &flash, &image).expect("reader verifies");
+    let c = flash_camera(&facts, &flash);
+    let original_bootstrap = c.lock().unwrap().bytes(CONFIGURATION + 0x80, 32);
+    let run = flash_run(&facts, &c, &flash, Some(&reader), true);
+    run.capture.unwrap().expect("state capture");
+    let record = run.flash.expect("flash backup");
+    let camera = c.lock().unwrap();
+    assert!(camera.violations.is_empty(), "{:?}", camera.violations);
+    // Read twice, hashed, and every byte delivered once in the first read.
+    let data = nand_bytes();
+    assert_eq!(record.reads, 2);
+    assert_eq!(record.size, FLASH_BYTES);
+    assert_eq!(record.sha256, hex(&checks::sha256_bytes(&data)));
+    let mut assembled = vec![0; FLASH_BYTES as usize];
+    for (offset, bytes) in &run.sunk {
+        assembled[*offset as usize..*offset as usize + bytes.len()].copy_from_slice(bytes);
+    }
+    assert_eq!(assembled, data);
+    assert_eq!(record.upload.image_sha256, pin.image_sha256);
+    assert_eq!(
+        record.upload.bootstrap_address,
+        u64::from(CONFIGURATION) + 0x80
+    );
+    // Upload, run, cleanup: one block per read, each freed; the reader ran
+    // only the stock page reader; nothing else executed.
+    let e = camera.exr2.as_ref().unwrap();
+    assert_eq!(e.allocations.len(), 2);
+    assert_eq!(e.released, e.allocations);
+    assert!(e.reader_runs >= 4, "control + data per read");
+    assert!(e.stock_entries.iter().all(|&s| s == e.stock_reader));
+    let allowed: Vec<u32> = [e.bootstrap]
+        .into_iter()
+        .chain(e.cache.iter().copied())
+        .chain(e.allocations.iter().copied())
+        .collect();
+    assert!(e.executed.iter().all(|x| allowed.contains(x)));
+    // The upload area is back as it was.
+    assert_eq!(
+        camera.word_at(camera.callback_slot()),
+        camera.stock_callback
+    );
+    assert_eq!(camera.bytes(CONFIGURATION + 0x80, 32), original_bootstrap);
+    assert_eq!(record.cleanup.len(), 2);
+    for cleanup in &record.cleanup {
+        assert!(cleanup.callback_restored && cleanup.bootstrap_restored);
+        assert!(cleanup.source_state_restored && cleanup.ram_gates_unchanged);
+        assert!(cleanup.allocation_released);
+    }
+    // The flash phase wrote no configuration byte: only the capture's two gates.
+    assert_eq!(
+        camera.configuration_writes,
+        [(EXR2_READ_GATE, 1), (EXR2_RESET_GUARD, 1)]
+    );
+}
+
+#[test]
+fn missing_facts_still_refuse_the_flash_backup_before_any_usb_command() {
+    let flash = test_flash();
+    let image = good_image();
+    let (pin, _) = reader_parts(&image, &flash);
+    let pinned = flash_facts(&pin);
+    let reader = verified(&pinned, &flash, &image).unwrap();
+    // Bundled facts: read_gate, reset_guard, slow_read_bytes and the reader
+    // are unlocated, even with a verified reader handed in.
+    let mut bundled = ServiceFacts::bundled();
+    bundled.flash_reader = high(pin.clone());
+    let mut cases = vec![(bundled, Some(&reader), "read_gate")];
+    // Gates located, but no pinned reader.
+    let mut unpinned = pinned.clone();
+    unpinned.flash_reader = ServiceFacts::bundled().flash_reader;
+    cases.push((unpinned, None, "flash_reader"));
+    // Gates located at offsets the reused reader does not read.
+    let mut elsewhere = located();
+    elsewhere.flash_reader = high(pin.clone());
+    cases.push((elsewhere, Some(&reader), "read_gate"));
+    for (facts, reader, first) in cases {
+        let c = flash_camera(&pinned, &flash);
+        let run = flash_run(&facts, &c, &flash, reader, false);
+        let Err(Error::Missing(missing)) = run.flash else {
+            panic!("flash must refuse: {:?}", run.flash.err());
+        };
+        assert!(missing.iter().any(|m| m.fact == first), "{missing:?}");
+        assert!(c.lock().unwrap().commands.is_empty(), "no USB command");
+    }
+    // And the state capture still refuses with the bundled facts.
+    assert!(matches!(
+        capture(&ServiceFacts::bundled(), &camera(Policy::read_only()), USB).result,
+        Err(Error::Missing(_))
+    ));
+    // Nothing is embedded at build time while the facts pin no reader.
+    assert!(ServiceFacts::bundled().flash_reader.value.is_none());
+    assert!(crate::flash::BUNDLED_READER.is_none());
+}
+
+#[test]
+fn modified_reader_image_or_artifact_is_rejected() {
+    let flash = test_flash();
+    let image = good_image();
+    let (pin, artifact) = reader_parts(&image, &flash);
+    let facts = flash_facts(&pin);
+    let bulk = bulk();
+    Reader::verify(&pin, &artifact, &image, &facts, &flash, &bulk).unwrap();
+    let mut changed = image.clone();
+    changed[36] ^= 1;
+    let error = Reader::verify(&pin, &artifact, &changed, &facts, &flash, &bulk).unwrap_err();
+    assert!(error.to_string().contains("pinned sha256"), "{error}");
+    let mut changed_artifact = artifact.clone();
+    let last = changed_artifact.len() - 2;
+    changed_artifact[last] = b' ';
+    assert!(Reader::verify(&pin, &changed_artifact, &image, &facts, &flash, &bulk).is_err());
+    // A camera block holding a different reader never runs.
+    let c = flash_camera(&facts, &flash);
+    c.lock().unwrap().exr2.as_mut().unwrap().body[4] ^= 1;
+    let reader = Reader::verify(&pin, &artifact, &image, &facts, &flash, &bulk).unwrap();
+    let run = flash_run(&facts, &c, &flash, Some(&reader), true);
+    assert!(run.flash.is_err());
+    assert!(c.lock().unwrap().exr2.as_ref().unwrap().reader_runs == 0);
+}
+
+#[test]
+fn reader_images_with_a_possible_flash_write_path_are_rejected_even_when_pinned() {
+    let flash = test_flash();
+    let cases: [(&str, u32); 8] = [
+        ("SVC", 0xef00_0000),
+        ("BL into firmware", 0xeb10_0000),
+        ("B out of the reader", 0xea00_0400),
+        ("MCR (cache/MPU)", 0xee07_0f15),
+        ("NAND controller literal", 0xfff5_2000),
+        ("DMA controller literal", 0xfff0_2000),
+        ("MOVT r0, #0xfff5", 0xe34f_0ff5),
+        ("MSR cpsr_c", 0xe321_f0d3),
+    ];
+    for (name, bad) in cases {
+        let image = image_with(&[NOP, bad, BRANCH_SELF]);
+        assert!(reader_scan::scan(&image).is_err(), "{name}");
+        let (pin, artifact) = reader_parts(&image, &flash);
+        let facts = flash_facts(&pin);
+        let error = Reader::verify(&pin, &artifact, &image, &facts, &flash, &bulk())
+            .expect_err(name)
+            .to_string();
+        assert!(error.contains("static screen"), "{name}: {error}");
+    }
+    assert!(reader_scan::scan(&good_image()).is_ok());
+}
+
+#[test]
+fn no_flash_write_path_is_reachable_in_the_flash_phase() {
+    let flash = test_flash();
+    let image = good_image();
+    let (pin, _) = reader_parts(&image, &flash);
+    let facts = flash_facts(&pin);
+    let reader = verified(&facts, &flash, &image).unwrap();
+    let (bulk, state) = (bulk(), state());
+    let inputs = Inputs {
+        facts: &facts,
+        bulk: &bulk,
+        state: &state,
+        flash: Some(&flash),
+        reader: Some(&reader),
+    };
+    let p = inputs.flash_policy();
+    let write = |address: u32, data: &[u8]| {
+        command(policy::MEMORY, 3, [0, 0, address, data.len() as u32], data)
+    };
+    // Firmware update, upload, console, restart and event commands.
+    for code in [0x660002, 0x550001, 0x760001, 0x110000, 0x2a0001] {
+        assert!(
+            p.check(&command(code, 0, [0; 4], &[])).is_err(),
+            "{code:#x}"
+        );
+    }
+    // No configuration write at all, stored or RAM.
+    for view in [0, 1] {
+        let w = command(policy::CONFIGURATION, 3, [view, 0, EXR2_READ_GATE, 1], &[1]);
+        assert!(p.check(&w).is_err());
+    }
+    // RAM writes: never into the NAND/DMA controllers, the boot ROM or any
+    // pinned stock code (including the stock NAND reader itself).
+    assert!(
+        p.check(&write(0xfff5_2000, &[0x80])).is_err(),
+        "NAND controller"
+    );
+    assert!(
+        p.check(&write(0xfff0_2000, &[1])).is_err(),
+        "DMA controller"
+    );
+    assert!(p.check(&write(0x8000_0000, &[1])).is_err(), "boot ROM");
+    let stock_reader = flash.code_ranges[0].address as u32;
+    assert!(p.check(&write(stock_reader + 8, &[0])).is_err());
+    assert!(p.check(&write(stock_reader | ALIAS, &[0])).is_err());
+    assert!(p.check(&write(PRIMITIVES as u32, &[0])).is_err());
+    assert!(
+        p.check(&write(HEAP, &[0, 0])).is_err(),
+        "longer than one byte"
+    );
+    assert!(matches!(
+        p.check(&write(HEAP, &[0])),
+        Ok(Kind::RamWrite { .. })
+    ));
+    assert!(matches!(
+        p.check(&write(HEAP | ALIAS, &[0])),
+        Ok(Kind::RamWrite { .. })
+    ));
+    // E0 data uploads stay blocked; E1 reads stay allowed.
+    assert!(check_control(RequestKind::WriteData).is_err());
+    // A catalog contract that names a write-side routine is refused.
+    let mut writer = flash.clone();
+    writer.code_ranges[2].name = "NAND program page".into();
+    assert!(crate::flash::read_side_only(&writer).is_err());
+    let mut eraser = flash.clone();
+    eraser.reader.as_mut().unwrap().symbol = "nand_erase_block".into();
+    assert!(crate::flash::read_side_only(&eraser).is_err());
+    assert!(crate::flash::read_side_only(&flash).is_ok());
+    // The flash module reaches the reused path only through backup().
+    let source = include_str!("flash.rs");
+    assert_eq!(
+        source.matches("fujimod_workflows::flash::backup(").count(),
+        1
+    );
+    for name in [
+        "read_spare",
+        "diagnose_nand",
+        "read_range(session, &",
+        "flash::build",
+        "write_range",
+        "write_memory",
+        "WriteConfiguration",
+        "write_byte_verified",
+        "research_command",
+        "install::",
+        "restart::",
+        "debug_mode::",
+        "service_mode::",
+        "send_event",
+        "submit_console",
+    ] {
+        assert!(!source.contains(name), "flash.rs mentions {name}");
+    }
+}
+
+#[test]
+fn failed_cleanup_is_reported_with_what_was_left() {
+    let flash = test_flash();
+    let image = good_image();
+    let (pin, _) = reader_parts(&image, &flash);
+    let facts = flash_facts(&pin);
+    let reader = verified(&facts, &flash, &image).unwrap();
+    let c = flash_camera(&facts, &flash);
+    c.lock().unwrap().exr2.as_mut().unwrap().refuse_release = true;
+    let run = flash_run(&facts, &c, &flash, Some(&reader), true);
+    let Err(Error::Flash(message)) = run.flash else {
+        panic!("flash must fail: {:?}", run.flash.map(|_| ()));
+    };
+    assert!(message.contains("NOT restored"), "{message}");
+    assert!(message.contains("bootstrap slot"), "{message}");
+    assert!(message.contains("heap allocation"), "{message}");
+    assert!(message.contains("pull the battery"), "{message}");
+}
+
+#[test]
+fn dry_run_and_plan_list_the_upload_and_send_nothing_for_it() {
+    let flash = test_flash();
+    let image = good_image();
+    let (pin, _) = reader_parts(&image, &flash);
+    let facts = flash_facts(&pin);
+    let reader = verified(&facts, &flash, &image).unwrap();
+    let (bulk, state) = (bulk(), state());
+    let inputs = Inputs {
+        facts: &facts,
+        bulk: &bulk,
+        state: &state,
+        flash: Some(&flash),
+        reader: Some(&reader),
+    };
+    let c = flash_camera(&facts, &flash);
+    c.lock().unwrap().policy = Some(Box::new(Policy::read_only()));
+    let report = block_on(async {
+        let mut session = peer_session(Device(c.clone()), 2 << 20, None)
+            .await
+            .unwrap();
+        inputs.dry_run(&mut session, USB).await
+    })
+    .expect("dry run");
+    let step = report
+        .plan
+        .iter()
+        .find(|s| s.name.starts_with("back up flash"))
+        .unwrap();
+    assert!(step.ready, "{:?}", step.refused_because);
+    let text = step.commands.join("\n");
+    assert!(text.contains(&pin.image_sha256), "{text}");
+    assert!(
+        text.contains(&format!("{:#x}", u64::from(CONFIGURATION) + 0x80)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("allocate {:#x}", PRIMITIVES)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("{} bytes", image.len() - 32)),
+        "{text}"
+    );
+    assert!(text.contains("twice"), "{text}");
+    let camera = c.lock().unwrap();
+    assert!(camera.violations.is_empty(), "{:?}", camera.violations);
+    assert!(camera.configuration_writes.is_empty());
+    let e = camera.exr2.as_ref().unwrap();
+    assert!(e.allocations.is_empty() && e.executed.is_empty());
+    // And without a pinned reader the offline plan refuses the upload.
+    let unpinned = Inputs {
+        reader: None,
+        ..inputs
+    };
+    let plan = unpinned.plan();
+    let step = plan
+        .iter()
+        .find(|s| s.name.starts_with("back up flash"))
+        .unwrap();
+    assert!(!step.ready);
+}
+
+#[test]
+fn reader_screen_covers_every_exr2_controller_block() {
+    let soc: serde_json::Value =
+        serde_json::from_str(include_str!("../../../catalog/soc/exr2/soc.json")).unwrap();
+    for block in soc["blocks"].as_array().unwrap() {
+        let base = block["base"].as_u64().unwrap();
+        let end = base + block["size"].as_u64().unwrap();
+        assert!(
+            reader_scan::PERIPHERAL_SPACE
+                .iter()
+                .any(|&(s, e)| base >= u64::from(s) && end <= u64::from(e)),
+            "{} at {base:#x}",
+            block["id"]
+        );
+    }
 }

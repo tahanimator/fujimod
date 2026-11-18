@@ -1,23 +1,30 @@
-//! Local, read-only X-E2 4.11 service-mode capture: identity, a dry run, and a
-//! camera state dump (DRAM and boot ROM) through the stock FF80 readers.
+//! Local X-E2 4.11 service-mode capture: identity, a dry run, a camera state
+//! dump (DRAM and boot ROM) through the stock FF80 readers, and an
+//! owner-approved whole-flash backup through temporary code in camera RAM.
 //!
 //! Safety model, enforced here and checked by [`policy`]:
-//! - Flash is never erased, programmed or written. There is no flash path at
-//!   all, because the only located X-E2 reader uploads and executes code.
+//! - Flash is never erased, programmed or written. The flash backup in
+//!   [`flash`] reuses the existing EXR II reader path unchanged with a reviewed
+//!   reader image pinned by hash, screened statically, uploaded to a heap block
+//!   in RAM and cleaned up afterwards; its own phase policy admits no flash,
+//!   firmware, stored-setting or configuration write.
 //! - Nothing persists: no stored-configuration writes, debug-mode save,
-//!   restart, firmware update, event, console, upload or memory write.
-//! - The only writes are the configuration-RAM read gate and reset guard, each
-//!   a single verified byte whose original value is recorded first. Both need
-//!   high-confidence located facts, and each step refuses without them.
+//!   restart, firmware update, event or console command.
+//! - The state capture's only writes are the configuration-RAM read gate and
+//!   reset guard, each a single verified byte whose original value is recorded
+//!   first. Both need high-confidence located facts, and each step refuses
+//!   without them; the flash step needs the same facts plus a pinned reader.
 //! - Identity (USB IDs, product, internal version) is verified before the
-//!   first write; stock code is verified before the reset guard and before
-//!   any capture. The code checks run first with the read gate as found; only
-//!   if the camera refuses those reads is the read gate enabled before them,
-//!   and then a failed check restores it to its original value.
+//!   first write; stock code is verified before the reset guard, before any
+//!   capture and before any upload. The code checks run first with the read
+//!   gate as found; only if the camera refuses those reads is the read gate
+//!   enabled before them, and then a failed check restores it.
 #![forbid(unsafe_code)]
 
 pub mod facts;
+pub mod flash;
 pub mod policy;
+pub mod reader_scan;
 
 use facts::{Missing, RamByte, ServiceFacts, UsbIds};
 use fujimod_catalog::capture::{FirmwareFlash, FirmwareState};
@@ -53,6 +60,10 @@ pub enum Error {
     CodeDiffers(String),
     #[error("{0}")]
     Capture(String),
+    #[error("flash backup stopped: {0}")]
+    Flash(String),
+    #[error("flash backup cleanup incomplete: {0}")]
+    Cleanup(String),
 }
 fn names(missing: &[Missing]) -> String {
     missing
@@ -69,6 +80,8 @@ pub struct Inputs<'a> {
     pub bulk: &'a FirmwareBulk,
     pub state: &'a FirmwareState,
     pub flash: Option<&'a FirmwareFlash>,
+    /// The verified, pinned flash reader, if the facts pin one.
+    pub reader: Option<&'a flash::Reader>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,6 +138,9 @@ pub struct Manifest {
     pub code_verified_before_any_write: bool,
     pub regions: Vec<RegionRecord>,
     pub refused: Vec<Step>,
+    /// Filled by the CLI after [`Inputs::back_up_flash`] when it was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash: Option<flash::FlashRecord>,
     pub reminder: &'static str,
 }
 
@@ -280,16 +296,6 @@ impl Inputs<'_> {
                     byte(guard)
                 )],
             },
-            Step {
-                name: "back up flash",
-                ready: true,
-                refused_because: self.require(&["flash_reader"]),
-                commands: vec![format!(
-                    "{} bytes of {} (refused: no read-only reader)",
-                    self.flash.map_or(0, |f| f.window.size),
-                    self.flash.map_or("flash", |f| f.device.kind.as_str()),
-                )],
-            },
         ];
         let mut dump = vec![
             "repeat identity and stock code checks (workflows::state::dump)".to_string(),
@@ -325,6 +331,12 @@ impl Inputs<'_> {
                 "slow_read_bytes",
             ]),
             commands: dump,
+        });
+        steps.push(Step {
+            name: "back up flash (temporary reader in RAM)",
+            ready: true,
+            refused_because: self.flash_refusals(),
+            commands: self.flash_plan(),
         });
         for step in &mut steps {
             step.ready = step.refused_because.is_empty();
@@ -626,6 +638,7 @@ impl Inputs<'_> {
             code_verified_before_any_write: verified_before_write,
             regions,
             refused: plan.into_iter().filter(|s| !s.ready).collect(),
+            flash: None,
             reminder: BATTERY_REMINDER,
         })
     }

@@ -45,12 +45,61 @@ pub struct RamByte {
     pub enabled_value: u8,
 }
 
-/// A located read-only flash reader. None exists for xe2-411; the type is kept
-/// so a future fact must state explicitly that its path performs no writes.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The reviewed EXR II flash reader pinned for upload to camera RAM. Both
+/// files sit beside the facts file and are embedded by `build.rs` only after
+/// their hashes match these pins and the image passes the static screen.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FlashReader {
+    /// Always `exr2-query-heap`, the transport in flash.generated.json.
     pub mechanism: String,
+    /// `fujimod_workflows::flash::Artifact` JSON (payload metadata).
+    pub artifact: String,
+    pub artifact_sha256: String,
+    /// The binary image the artifact names (bootstrap + reader + observer).
+    pub image: String,
+    pub image_sha256: String,
+    pub image_bytes: u32,
+    /// Who reviewed the reader and from which source revision.
+    pub review: String,
+}
+pub const FLASH_MECHANISM: &str = "exr2-query-heap";
+
+fn sha256_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+fn plain_file(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+impl FlashReader {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mechanism != FLASH_MECHANISM {
+            return Err(format!("flash reader mechanism must be {FLASH_MECHANISM}"));
+        }
+        if !plain_file(&self.artifact) || !plain_file(&self.image) {
+            return Err("flash reader files must be plain names beside the facts".into());
+        }
+        if !sha256_text(&self.artifact_sha256) || !sha256_text(&self.image_sha256) {
+            return Err("flash reader hashes must be lowercase sha256".into());
+        }
+        if self.image_bytes as usize <= crate::reader_scan::BOOTSTRAP_SLOT
+            || self.image_bytes as usize > crate::reader_scan::MAX_IMAGE
+        {
+            return Err("flash reader image size is outside the EXR II ABI".into());
+        }
+        if self.review.trim().is_empty() {
+            return Err("flash reader must name its review".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,6 +175,9 @@ impl ServiceFacts {
             .is_some_and(|n| n == 0 || n > 4096)
         {
             return Err("slow_read_bytes must be 1..=4096".into());
+        }
+        if let Some(reader) = &facts.flash_reader.value {
+            reader.validate()?;
         }
         Ok(facts)
     }
