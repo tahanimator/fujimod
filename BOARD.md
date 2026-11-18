@@ -10,8 +10,8 @@ Firmware: X-E2 4.11, `FWUP0004.DAT`, sha256
 `d324e1475dd99d5ebace3bf689262df671829adb32262ba13cd9b0743ca99bb7`, at
 `/home/claude/fw/FWUP0004.DAT` (never commit it).
 
-Scope: software-only stages in `catalog/progress/xe2/4.11/`. Nothing here
-touches a physical camera.
+Scope: software-only stages in `catalog/progress/xe2/4.11/`. Only U16 touched
+a physical camera (owner-approved, owner's own X-E2).
 
 | Unit | Stage(s) in progress file | Status | Owner | Models used | Result / notes |
 |---|---|---|---|---|---|
@@ -29,9 +29,55 @@ touches a physical camera.
 | U11 | Locate xe2-411 service facts read_gate, reset_guard, slow_read_bytes | blocked | U11-worker | Opus | All three remain UNLOCATED: no X-E2 4.11 code directly shows the values and X70's 0xf7/0xa3 were not borrowed (guessing). Located the FF80 command infrastructure (dispatch table 0x146c024, descriptors 04cb:ff80, session struct 0x15434f0, parser 0x10c89c0) but did not isolate the 200001 read-handler gate/size or the teardown guard-byte to a high bar. Tool unchanged; gates intact; capture still correctly refused; tests 12/12 + workflows service_capture 11/11 pass. See "U11 findings". |
 | U13 | Flash backup via temporary RAM code in xe2-capture (owner-approved) | review | U13-worker | Opus | `fujimod-xe2-capture capture DIR --flash` (commit 95caadf) reuses `fujimod_workflows::flash::backup` (EXR II `exr2-query-heap`) unchanged: upload to a stock heap block in RAM, run, read NAND via the stock page reader, clean up; read twice, hashed, cleanup read back and reported. Still REFUSED before any USB command: read_gate/reset_guard/slow_read_bytes unlocated, AND no reviewed X-E2 reader image exists in the repo to pin (the reader source and staged flash-reader artifacts are external). Tests 20/20; workflows 87/87. See "U13 findings". |
 | U14 | Emulator trace of xe2-411 service facts (read_gate, reset_guard, slow_read_bytes) | blocked | U14-worker | Opus | Could NOT bring up X-E2 4.11 in the repo's emulator on this machine, so no FF80 handler behavior was observed; all three facts stay null/unlocated (not guessed, X70's 0xf7/0xa3 not borrowed). Blockers: (A) native boot refuses xe2-411 — run.json has null inputs/scene/execution ("configuration xe2-411 declares no startup inputs", reproduced) and open_exr2 requires the 16 KiB boot ROM sha256 4ecedfbf… which is absent everywhere; (B) web/wasm simulated camera needs a prebuilt USB wasm bundle + emulate.usb catalog facts + xe2 boot.service controls + wasm/nightly toolchain, all absent/unavailable; (C) no in-repo fixture runs the firmware answering FF80 (usb-app80 tests use a scripted transport, not an emulated board). Unicorn CPU + emulator crates build/run here — the blocker is firmware bring-up, not execution. Facts evidence updated with the emulator attempt; gates intact; capture still correctly refused. Tests 20/20, service_capture 11/11, plan refuses steps 2-6 naming the facts. See "U14 findings". |
+| U16 | First real-camera state dump (owner's X-E2, local Windows session, `capture --assume-x70-values`) | done | U16-worker | Opus 5.5 (local, no subagents) | Owner-approved run on 2026-11-18 succeeded: identity X-E2 / 3.05 over FF80; read gate 0xf7 opened and all 15 stock-code checks matched; guard 0xa3 armed; 512 MiB DRAM + 16 KiB boot ROM saved. **Boot ROM sha256 = `4ecedfbf…f9be`, the exact ROM `open_exr2` requires** (unblocks U14/U6 locally; ROM never committed). The three values stay UNVERIFIED in the facts file; run evidence below. Found a tool bug: the session is never closed, so a second run after `dry-run` fails with "already has an open service session" until a battery pull. See "U16 findings". |
 | U15 | Explicit unverified X70-assumed service-values override for xe2-capture | review | U15-worker | Opus | Added an opt-in override: flag `--assume-x70-values` + separate inputs file `facts/xe2-411-service-facts.x70-assumed.json` injects the X70 1.10 values (read_gate offset 0xf7=1, reset_guard 0xa3=1, slow_read_bytes 256) for the three unlocated facts ONLY, each marked "UNVERIFIED: borrowed from x70-110". Honest `xe2-411-service-facts.json` untouched (three facts stay null/unverified). Without the flag capture still refuses; with it the state dump runs after a loud multi-line WARNING. Identity (04cb:ff80 / X-E2 / 3.05), stock-code hash checks, the write allowlist, the reader hash pin, twice-read/verify and cleanup are all unchanged; the manifest records `assumed_x70_values` with provenance. `--flash` still blocked (no reviewed reader pinned). Dry-run cannot confirm the values — first real run is the test. Tests 27/27; workflows service_capture 11/11; clippy clean. See "U15 findings". |
 
 ## Worker notes
+
+### U16 findings — first real-camera state dump (2026-11-18)
+
+**Setup.** Owner's X-E2 on 4.11 (`FWUP0004.DAT` sha256 `d324e147…99bb7`),
+service mode via selector UP + full shutter at power-on with USB connected,
+WinUSB bound with Zadig, Windows 11, `fujimod-xe2-capture` built from `b0c9e995`
+(`cargo build --release --locked -p fujimod-xe2-capture`, stable 1.100.0 MSVC).
+
+**Dry run** (`dry-run --assume-x70-values`): 8 FF80 commands, all read-only.
+Product `X-E2`, internal version `3.05`, configuration RAM 4,325,376 bytes in
+256-byte pages. RAM bytes 0xf7 and 0xa3 both read `0`. Debug memory reads
+(0x200001 fn2) were refused with the gate byte at 0, so code checks were not run.
+
+**Capture, attempt 1:** stopped at session open with "the camera already has an
+open service session" (`crates/usb/src/ff80/session.rs` open reply `[0,0]`,
+packet 256). No command was sent and no write happened. Cause: `xe2-capture`
+calls `begin_session` but never closes the session, and `Session` drop sends no
+close, so the dry run's session stays open on the camera. Workaround: battery
+pull + re-entry before each run. Fix (todo): close the session after `dry-run` /
+`capture`, or `Connection::reclaim_session()` before opening.
+
+**Capture, attempt 2** (after battery pull, no dry run first): exit 0, 182 FF80
+commands audited, all inside the policy. Manifest: `code_verified_before_any_write
+= false`; gates `read_gate` offset 247 original 0 → 1 (written), `reset_guard`
+offset 163 original 0 → 1 (written). Files (kept on the owner's PC, never committed):
+- `boot-rom.bin` 16384 bytes, read twice and equal, sha256
+  `4ecedfbfc1910bde488d36abe4380621f8845e6afcfc6cf54a49a33ec0abf9be`. That is
+  the `boot_rom` hash in firmware.json / `open_exr2`, so the X-E2 has the same
+  EXR II boot ROM as the X70.
+- `dram.bin` 536870912 bytes, sha256 `f97e04d9…655c8` (may hold owner data; private).
+The camera did not hang or reset. The owner exited by battery pull.
+
+**What the run shows about the three values (not promoted to facts):**
+- `read_gate` 0xf7 = 1: **strong empirical evidence.** Debug reads were refused
+  with 0xf7 = 0. After writing 1, all 15 stock-code regions read back with their
+  catalog sha256. Still needs a firmware/emulator trace of the handler to mark it
+  `high`.
+- `slow_read_bytes` 256: 256-byte slow reads succeed, so the limit is ≥ 256.
+  The true maximum is not shown.
+- `reset_guard` 0xa3 = 1: written without visible effect. **No evidence either
+  way.**
+`facts/xe2-411-service-facts.json` is unchanged: all three are still null/unverified.
+
+**Next:** U14 can now run locally with the captured ROM (`--boot-rom`). It still
+needs xe2-411 native run inputs/scene/execution, per U14 (A).
 
 ### U15 findings — explicit unverified X70-assumed service-values override
 
