@@ -22,6 +22,18 @@ files that generators only read.
 Never put binary data larger than 128 bytes in JSON, whether as base64, hex or
 number arrays. Write it to a separate binary file and reference that file by path from the JSON.
 
+## Decision records
+
+Decisions that shaped the project live as records under `docs/decisions`, one
+per file (`NNNN-slug.md`); see its `README.md`. Before relitigating a settled
+choice, read the record; before changing one, supersede it with a new record
+rather than editing the old one. Add a record for a decision that a later worker
+would otherwise re-derive, and run `mise run decisions` to rebuild the generated
+index. A record's `code` field lists the paths it governs; an annotatable source
+file there cites the record back with a `decision NNNN` comment.
+`mise run decisions-check` validates the records, the back-references, and that
+the index is current, and runs in CI.
+
 ## Checkouts and commits
 
 Work, test and commit in the existing checkout on `main`. Do not create Git

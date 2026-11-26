@@ -30,6 +30,9 @@ jobs:
         run: mise run python-format-check
       - if: ${{ !cancelled() }}
         run: mise run python-typecheck
+      - name: Check the decision records and generated index
+        if: ${{ !cancelled() }}
+        run: mise run decisions-check
 
   rust-quality:
     name: Rust format and Clippy

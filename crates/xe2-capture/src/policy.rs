@@ -11,6 +11,8 @@
 //! code, and diagnostic queries that run the uploaded reader. It permits no
 //! configuration write, no stored write, no data upload (E0) and no firmware,
 //! restart or console command, so no flash erase/program request can be sent.
+//!
+//! Rationale: see decision 0003 in `docs/decisions`.
 use crate::facts::RamByte;
 
 pub const DEVICE_INFO: u32 = 0x150000;

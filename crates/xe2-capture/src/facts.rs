@@ -1,4 +1,6 @@
 //! Hand-authored service-capture facts with per-fact evidence.
+//!
+//! Rationale: see decision 0003 and decision 0004 in `docs/decisions`.
 use serde::{Deserialize, Serialize};
 
 /// The checked-in X-E2 4.11 facts. Hand-authored, never generated.

@@ -35,6 +35,15 @@ run = "python scripts/git/land.py"
 description = "Install the worktree guard and LFS Git hooks"
 run = "python scripts/git/install_hooks.py"
 
+# These tasks are governed by decision 0001 (docs/decisions).
+[tasks.decisions]
+description = "Regenerate the decision-record index (docs/decisions/index.generated.md)"
+run = "uv run --locked python scripts/docs/decisions.py"
+
+[tasks.decisions-check]
+description = "Check the decision records and that their index is current"
+run = "uv run --locked python scripts/docs/decisions.py --check"
+
 [tasks.web-build]
 dir = "{{config_root}}/apps/web"
 run = "pnpm run build"
